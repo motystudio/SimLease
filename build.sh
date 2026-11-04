@@ -8,9 +8,6 @@ rm -rf build && mkdir -p "$APP/Contents/MacOS"
 swiftc -O -swift-version 5 -target arm64-apple-macos14 -parse-as-library \
   app/SimBar.swift -o "$APP/Contents/MacOS/SimBar"
 
-mkdir -p "$APP/Contents/Resources"
-cp app/claude.svg "$APP/Contents/Resources/claude.svg"
-
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -29,6 +26,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --sign - "$APP"
+
+# a real copy (not a symlink into ~/Documents), so SimBar never triggers the Documents privacy prompt
+mkdir -p "$HOME/.claude/bin"
+rm -f "$HOME/.claude/bin/sim-lease"
+install -m 755 bin/sim-lease "$HOME/.claude/bin/sim-lease"
 
 mkdir -p "$HOME/Applications"
 pkill -x SimBar 2>/dev/null || true

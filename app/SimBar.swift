@@ -313,50 +313,35 @@ struct DeviceRow: View {
     @EnvironmentObject var store: Store
     let device: Device
     @State private var confirmKill = false
-    @State private var hovering = false
-
-    /// Claude logo (app/claude.svg), template so it follows the text color.
-    static let claudeImage: NSImage = {
-        let img = NSImage(contentsOf: Bundle.main.url(forResource: "claude", withExtension: "svg")!)!
-        img.isTemplate = true
-        return img
-    }()
-
-    var claudeIcon: some View {
-        Image(nsImage: DeviceRow.claudeImage).resizable().scaledToFit().frame(width: 15, height: 15)
-    }
 
     var body: some View {
         let session = store.session(for: device)
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
+            // device icon: shows the simulator
             Image(systemName: device.isIOS ? "iphone" : "smartphone")
                 .font(.system(size: 18))
                 .foregroundStyle(device.live ? Color.blue : .secondary)
-                .frame(width: 22)
+                .frame(width: 30, height: 40)
+                .hoverTarget(help: L("Show the simulator", "Afficher le simulateur")) { store.show(device) }
+            // name + status: opens the session using it, if any
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.name.isEmpty ? device.id : device.name).font(.system(size: 13, weight: .medium))
                 status(session).font(.system(size: 11)).foregroundStyle(.secondary)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .hoverTarget(enabled: session != nil,
+                         help: session.map { L("Open session “\($0.title)”", "Ouvrir la session « \($0.title) »") } ?? "") {
+                if let s = session { store.open(s) }
+            }
             Spacer(minLength: 4)
             usageView
             if store.busy.contains(device.id) {
-                ProgressView().controlSize(.small).frame(width: 96)
+                ProgressView().controlSize(.small).frame(width: 70)
             } else {
-                HStack(spacing: 2) {
-                    if let s = session {
-                        Button { store.open(s) } label: {
-                            claudeIcon.frame(width: 22, height: 22)
-                        }
-                        .buttonStyle(.borderless)
-                        .help(L("Open session “\(s.title)”", "Ouvrir la session « \(s.title) »"))
-                    } else {
-                        Color.clear.frame(width: 22, height: 22)   // keeps the columns aligned
-                    }
-                    iconButton(device.pinned ? "pin.fill" : "pin",
-                               help: device.pinned ? L("Stop keeping alive", "Ne plus garder allumé") : L("Keep alive: never shut down automatically", "Garder allumé : jamais éteint automatiquement"),
-                               tint: device.pinned ? .accentColor : nil) { store.togglePin(device) }
-                }
+                iconButton(device.pinned ? "pin.fill" : "pin",
+                           help: device.pinned ? L("Stop keeping alive", "Ne plus garder allumé") : L("Keep alive: never shut down automatically", "Garder allumé : jamais éteint automatiquement"),
+                           tint: device.pinned ? .accentColor : nil) { store.togglePin(device) }
                 if confirmKill {
                     Button(L("Shut down?", "Éteindre ?")) { store.kill(device); confirmKill = false }
                         .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
@@ -370,14 +355,7 @@ struct DeviceRow: View {
                 }
             }
         }
-        .padding(.vertical, 6).padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(Color.primary.opacity(hovering ? 0.07 : 0)))
-        .padding(.horizontal, 4)
-        .contentShape(Rectangle())
-        .onHover { hovering = $0 }
-        .onTapGesture { store.show(device) }
-        .help(L("Click to show the simulator", "Cliquer pour afficher le simulateur"))
+        .padding(.vertical, 3).padding(.horizontal, 8)
         .contextMenu {
             Button(L("Copy identifier", "Copier l'identifiant")) {
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString(device.id, forType: .string)
@@ -421,6 +399,30 @@ struct DeviceRow: View {
                 .foregroundStyle(tint ?? .primary)
         }
         .buttonStyle(.borderless).help(help)
+    }
+}
+
+/// A clickable part of a row that highlights on its own when hovered.
+struct HoverTarget: ViewModifier {
+    let enabled: Bool
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.primary.opacity(enabled && hovering ? 0.08 : 0)))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .onHover { hovering = $0 }
+            .onTapGesture { if enabled { action() } }
+            .help(help)
+    }
+}
+
+extension View {
+    func hoverTarget(enabled: Bool = true, help: String, action: @escaping () -> Void) -> some View {
+        modifier(HoverTarget(enabled: enabled, help: help, action: action))
     }
 }
 

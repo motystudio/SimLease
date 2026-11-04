@@ -5,8 +5,8 @@ Partage des simulateurs iOS et émulateurs Android entre plusieurs sessions Clau
 - **`bin/sim-lease`** : chaque session « loue » un appareil au lieu d'en démarrer un nouveau. Le script réutilise un appareil allumé et libre, n'en démarre un que sous un plafond, et éteint ceux qui ne servent plus.
 - **`app/SimBar.swift`** : app de barre des menus (en anglais, en français si le système est en français) qui montre :
   - les appareils démarrés, avec la RAM et le CPU de chacun ;
-  - quelle session les utilise, avec un bouton Claude pour y aller ;
-  - un clic sur une ligne affiche le simulateur (Android : la fenêtre de l'émulateur ; iOS : Simulator.app, ou DeviceHub depuis Xcode 27, qui ne permet pas de choisir l'appareil) ;
+  - quelle session les utilise : un clic sur le nom et la description ouvre cette session ;
+  - un clic sur l'icône du téléphone affiche le simulateur (Android : la fenêtre de l'émulateur ; iOS : Simulator.app, ou DeviceHub depuis Xcode 27, qui ne permet pas de choisir l'appareil) ;
   - un bouton pour éteindre, et une punaise pour **garder un appareil allumé** : il n'est alors jamais éteint automatiquement.
 
   Elle lance aussi le nettoyage toutes les 5 min. Si l'icône est cachée dans la barre des menus, relancer l'app ouvre le panneau dans une fenêtre.
@@ -14,8 +14,7 @@ Partage des simulateurs iOS et émulateurs Android entre plusieurs sessions Clau
 ## Installation
 
 ```bash
-ln -sf "$PWD/bin/sim-lease" ~/.claude/bin/sim-lease
-./build.sh          # compile et installe ~/Applications/SimBar.app
+./build.sh          # installe ~/.claude/bin/sim-lease (copie) et ~/Applications/SimBar.app
 open ~/Applications/SimBar.app
 ```
 
@@ -24,6 +23,8 @@ Ajouter aussi le bloc `<simulators>` dans `~/.claude/CLAUDE.md` (voir `CLAUDE.sn
 ```json
 { "hooks": [{ "type": "command", "command": "$HOME/.claude/bin/sim-lease release-session", "timeout": 30 }] }
 ```
+
+Relancer `./build.sh` après chaque modification de `bin/sim-lease`. C'est une copie et pas un lien symbolique : sinon macOS demande à SimBar l'accès au dossier Documents.
 
 ## Fonctionnement
 
