@@ -161,6 +161,108 @@ func scanDesktopSessions() -> [String: DesktopSession] {
     return map
 }
 
+// MARK: - Setup (what needs to be in ~/.claude for sim-lease to work)
+
+enum SetupItem: CaseIterable {
+    case script, rule, hook
+
+    var title: String {
+        switch self {
+        case .script: return L("sim-lease script", "Script sim-lease")
+        case .rule: return L("CLAUDE.md rule", "Règle CLAUDE.md")
+        case .hook: return L("SessionEnd hook", "Hook SessionEnd")
+        }
+    }
+}
+
+enum SetupState: Equatable { case ok, missing, outdated }
+
+/// Checks and installs the script, the CLAUDE.md rule and the SessionEnd hook, from the
+/// copies bundled in the app. `claudeDir` is ~/.claude (another folder for `--setup` tests).
+struct Setup {
+    let claudeDir: String
+    static let hookCommand = "$HOME/.claude/bin/sim-lease release-session"
+    private static let ruleStart = "<simulators>", ruleEnd = "</simulators>"
+
+    private var scriptPath: String { "\(claudeDir)/bin/sim-lease" }
+    private var rulePath: String { "\(claudeDir)/CLAUDE.md" }
+    private var settingsPath: String { "\(claudeDir)/settings.json" }
+    private func bundled(_ name: String) -> String { Bundle.main.path(forResource: name, ofType: nil)! }
+
+    func state(_ item: SetupItem) -> SetupState {
+        let fm = FileManager.default
+        switch item {
+        case .script:
+            guard fm.fileExists(atPath: scriptPath) else { return .missing }
+            return fm.contentsEqual(atPath: scriptPath, andPath: bundled("sim-lease")) ? .ok : .outdated
+        case .rule:
+            guard let md = try? String(contentsOfFile: rulePath, encoding: .utf8),
+                  let block = Setup.ruleBlock(in: md) else { return .missing }
+            let snippet = (try? String(contentsOfFile: bundled("CLAUDE.snippet.md"), encoding: .utf8)) ?? ""
+            return md[block].trimmingCharacters(in: .whitespacesAndNewlines)
+                == snippet.trimmingCharacters(in: .whitespacesAndNewlines) ? .ok : .outdated
+        case .hook:
+            guard let data = fm.contents(atPath: settingsPath),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let hooks = json["hooks"] as? [String: Any],
+                  let end = hooks["SessionEnd"] as? [[String: Any]] else { return .missing }
+            let commands = end.flatMap { ($0["hooks"] as? [[String: Any]]) ?? [] }.compactMap { $0["command"] as? String }
+            return commands.contains { $0.contains("sim-lease release-session") } ? .ok : .missing
+        }
+    }
+
+    func install(_ item: SetupItem) throws {
+        guard state(item) != .ok else { return }   // never add a second hook or rule
+        let fm = FileManager.default
+        switch item {
+        case .script:
+            try fm.createDirectory(atPath: "\(claudeDir)/bin", withIntermediateDirectories: true)
+            try? fm.removeItem(atPath: scriptPath)   // also replaces an old symlink into the repo
+            try fm.copyItem(atPath: bundled("sim-lease"), toPath: scriptPath)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+        case .rule:
+            let snippet = try String(contentsOfFile: bundled("CLAUDE.snippet.md"), encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var md = (try? String(contentsOfFile: rulePath, encoding: .utf8)) ?? ""
+            if let block = Setup.ruleBlock(in: md) {
+                md.replaceSubrange(block, with: snippet)
+            } else {
+                md += (md.isEmpty || md.hasSuffix("\n\n") ? "" : md.hasSuffix("\n") ? "\n" : "\n\n") + snippet + "\n"
+            }
+            try md.write(toFile: rulePath, atomically: true, encoding: .utf8)
+        case .hook:
+            // jq keeps the user's key order and formatting; a backup is kept next to the file
+            if !fm.fileExists(atPath: settingsPath) { try "{}\n".write(toFile: settingsPath, atomically: true, encoding: .utf8) }
+            let backup = settingsPath + ".backup-simbar"
+            try? fm.removeItem(atPath: backup)
+            try fm.copyItem(atPath: settingsPath, toPath: backup)
+            let filter = #".hooks.SessionEnd = ((.hooks.SessionEnd // []) + [{"hooks":[{"type":"command","command":$c,"timeout":30}]}])"#
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/jq")
+            p.arguments = ["--arg", "c", Setup.hookCommand, filter, settingsPath]
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0, !data.isEmpty else {
+                throw NSError(domain: "SimBar", code: Int(p.terminationStatus),
+                              userInfo: [NSLocalizedDescriptionKey: "jq could not update settings.json"])
+            }
+            let perms = try fm.attributesOfItem(atPath: settingsPath)[.posixPermissions]
+            try data.write(to: URL(fileURLWithPath: settingsPath), options: .atomic)
+            if let perms { try fm.setAttributes([.posixPermissions: perms], ofItemAtPath: settingsPath) }
+        }
+    }
+
+    private static func ruleBlock(in md: String) -> Range<String.Index>? {
+        guard let start = md.range(of: ruleStart), let end = md.range(of: ruleEnd, range: start.upperBound..<md.endIndex)
+        else { return nil }
+        return start.lowerBound..<end.upperBound
+    }
+}
+
 @MainActor
 final class Store: ObservableObject {
     static let shared = Store()
@@ -174,6 +276,9 @@ final class Store: ObservableObject {
         didSet { UserDefaults.standard.set(autoReap, forKey: "autoReap") }
     }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var setupStates: [SetupItem: SetupState] = [:]
+    var setupIncomplete: Bool { setupStates.values.contains { $0 != .ok } }
+    nonisolated let setup = Setup(claudeDir: "\(home)/.claude")
 
     private var sessions: [String: DesktopSession] = [:]   // cliSessionId -> desktop session
     private var timer: Timer?
@@ -185,6 +290,9 @@ final class Store: ObservableObject {
     nonisolated private let queue = DispatchQueue(label: "com.motystudio.simbar.commands")
 
     init() {
+        if let i = CommandLine.arguments.firstIndex(of: "--setup"), i + 1 < CommandLine.arguments.count {
+            Store.setupTest(claudeDir: CommandLine.arguments[i + 1])
+        }
         refresh()
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
             snapshot(to: CommandLine.arguments[i + 1])
@@ -218,13 +326,15 @@ final class Store: ObservableObject {
             let data = run(["json"])
             let list = (try? JSONDecoder().decode([Device].self, from: data)) ?? []
             let usage = sampler.sample()
+            let setup = Dictionary(uniqueKeysWithValues: SetupItem.allCases.map { ($0, self.setup.state($0)) })
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self.apply(list, usage, done: ids) }
+                MainActor.assumeIsolated { self.apply(list, usage, setup, done: ids) }
             }
         }
     }
 
-    private func apply(_ list: [Device], _ usage: [String: Usage], done ids: Set<String>) {
+    private func apply(_ list: [Device], _ usage: [String: Usage], _ setup: [SetupItem: SetupState], done ids: Set<String>) {
+        if setup != setupStates { setupStates = setup }
         if list != devices { devices = list }
         if usage != self.usage { self.usage = usage }
         busy.subtract(ids)
@@ -320,6 +430,39 @@ final class Store: ObservableObject {
             }
             exit(0)
         }
+    }
+
+    /// Installs the given setup items on the command queue, then reloads; shows an alert on failure.
+    func install(_ items: [SetupItem]) {
+        let setup = self.setup
+        queue.async {
+            var failure: String?
+            for item in items {
+                do { try setup.install(item) } catch { failure = "\(item.title): \(error.localizedDescription)" }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    if let failure {
+                        let alert = NSAlert()
+                        alert.messageText = L("Installation failed", "L'installation a échoué")
+                        alert.informativeText = failure
+                        alert.runModal()
+                    }
+                    self.refresh()
+                }
+            }
+        }
+    }
+
+    /// Debug: `SimBar --setup DIR` checks, installs into DIR (a stand-in for ~/.claude), checks again, exits.
+    private static func setupTest(claudeDir: String) -> Never {
+        let s = Setup(claudeDir: claudeDir)
+        for item in SetupItem.allCases { print("before", item, s.state(item)) }
+        for item in SetupItem.allCases {
+            do { try s.install(item) } catch { print("install", item, "failed:", error) }
+        }
+        for item in SetupItem.allCases { print("after", item, s.state(item)) }
+        exit(0)
     }
 
     func setLaunchAtLogin(_ on: Bool) {
@@ -511,6 +654,28 @@ struct Panel: View {
             Toggle(L("Launch at login", "Lancer à l'ouverture de session"), isOn: Binding(
                 get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
             Divider()
+            Section(L("Setup", "Installation")) {
+                ForEach(SetupItem.allCases, id: \.self) { item in
+                    switch store.setupStates[item] ?? .ok {
+                    case .ok:
+                        Label(L("\(item.title) installed", "\(item.title) installé"), systemImage: "checkmark.circle.fill")
+                    case .missing:
+                        Button { store.install([item]) } label: {
+                            Label(L("Install \(item.title)", "Installer : \(item.title)"), systemImage: "exclamationmark.triangle.fill")
+                        }
+                    case .outdated:
+                        Button { store.install([item]) } label: {
+                            Label(L("Update \(item.title)", "Mettre à jour : \(item.title)"), systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                }
+                if store.setupIncomplete {
+                    Button(L("Install everything", "Tout installer")) {
+                        store.install(SetupItem.allCases.filter { store.setupStates[$0] != .ok })
+                    }
+                }
+            }
+            Divider()
             Button(L("Open log", "Ouvrir le journal")) {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "\(home)/.claude/sim-leases/sim-lease.log"))
             }
@@ -518,6 +683,11 @@ struct Panel: View {
             Button(L("Quit SimBar", "Quitter SimBar")) { NSApp.terminate(nil) }
         } label: {
             Image(systemName: "gearshape").frame(width: 22, height: 22)
+                .overlay(alignment: .topTrailing) {
+                    if store.setupIncomplete {   // something from Setup still needs installing
+                        Circle().fill(Color.orange).frame(width: 7, height: 7).offset(x: -1, y: 2)
+                    }
+                }
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help(L("Settings", "Réglages"))
     }

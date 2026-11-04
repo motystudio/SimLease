@@ -25,6 +25,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# what SimBar's Setup menu installs into ~/.claude
+mkdir -p "$APP/Contents/Resources"
+cp bin/sim-lease CLAUDE.snippet.md "$APP/Contents/Resources/"
+
 codesign --force --sign - "$APP"
 
 # a real copy (not a symlink into ~/Documents), so SimBar never triggers the Documents privacy prompt

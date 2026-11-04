@@ -18,7 +18,9 @@ Partage des simulateurs iOS et émulateurs Android entre plusieurs sessions Clau
 open ~/Applications/SimBar.app
 ```
 
-Ajouter aussi le bloc `<simulators>` dans `~/.claude/CLAUDE.md` (voir `CLAUDE.snippet.md`), et ce hook `SessionEnd` dans `~/.claude/settings.json` :
+Ensuite, dans SimBar, **⚙ → Setup** indique si le script, la règle `<simulators>` de `~/.claude/CLAUDE.md` et le hook `SessionEnd` sont installés et à jour, et les installe en un clic (un point orange sur la roue signale qu'il manque quelque chose). L'app embarque sa propre copie de `bin/sim-lease` et de `CLAUDE.snippet.md`. Le hook est ajouté avec `jq` en gardant le reste de `settings.json` intact, et une sauvegarde est faite dans `settings.json.backup-simbar`.
+
+À la main, le hook correspond à :
 
 ```json
 { "hooks": [{ "type": "command", "command": "$HOME/.claude/bin/sim-lease release-session", "timeout": 30 }] }
@@ -64,4 +66,4 @@ sim-lease shutdown-idle
 sim-lease reap
 ```
 
-Debug de l'app : `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` dessine le panneau avec les vraies données (certains boutons y apparaissent comme des carrés jaunes, c'est une limite d'`ImageRenderer`).
+Debug de l'app : `SimBar --setup DOSSIER` teste l'installation dans un faux `~/.claude`, et `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` dessine le panneau avec les vraies données (certains boutons y apparaissent comme des carrés jaunes, c'est une limite d'`ImageRenderer`).
