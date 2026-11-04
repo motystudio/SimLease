@@ -164,6 +164,7 @@ final class Store: ObservableObject {
     @Published var devices: [Device] = []
     @Published var usage: [String: Usage] = [:]
     @Published var busy: Set<String> = []
+    @Published var pinOverride: [String: Bool] = [:]
     @Published var loading = false
     @Published var autoReap: Bool = UserDefaults.standard.object(forKey: "autoReap") as? Bool ?? true {
         didSet { UserDefaults.standard.set(autoReap, forKey: "autoReap") }
@@ -195,15 +196,22 @@ final class Store: ObservableObject {
         }
     }
 
-    func refresh() {
+    func refresh() { perform([]) }
+
+    /// Runs sim-lease commands in the background, reloads the list, and only then clears
+    /// `done` from busy / pin overrides, so the row never flickers back to its old state.
+    private func perform(_ commands: [[String]], done ids: Set<String> = []) {
         loading = true
         Task.detached {
+            for c in commands { run(c) }
             let data = run(["json"])
             let list = (try? JSONDecoder().decode([Device].self, from: data)) ?? []
             let usage = self.sampler.sample()
             await MainActor.run {
                 if list != self.devices { self.devices = list }
                 if usage != self.usage { self.usage = usage }
+                self.busy.subtract(ids)
+                for id in ids { self.pinOverride.removeValue(forKey: id) }
                 self.loading = false
                 if list.contains(where: { !$0.isUnmanaged && $0.session != "none" && self.sessions[$0.session] == nil }) {
                     self.loadSessions()
@@ -214,35 +222,28 @@ final class Store: ObservableObject {
 
     func kill(_ d: Device) {
         busy.insert(d.id)
-        Task.detached {
-            run(["kill", d.id])
-            await MainActor.run { self.busy.remove(d.id); self.refresh() }
-        }
+        perform([["kill", d.id]], done: [d.id])
     }
 
     func killIdle() {
-        busy.formUnion(devices.filter { !$0.live && !$0.pinned }.map(\.id))
-        Task.detached {
-            run(["shutdown-idle"])
-            await MainActor.run { self.busy.removeAll(); self.refresh() }
-        }
+        let ids = Set(devices.filter { !$0.live && !isPinned($0) }.map(\.id))
+        busy.formUnion(ids)
+        perform([["shutdown-idle"]], done: ids)
     }
 
+    /// Pin state shown in the UI: flips immediately on click, before sim-lease confirms it.
+    func isPinned(_ d: Device) -> Bool { pinOverride[d.id] ?? d.pinned }
+
     func togglePin(_ d: Device) {
-        busy.insert(d.id)
-        Task.detached {
-            run([d.pinned ? "unpin" : "pin", d.id])
-            await MainActor.run { self.busy.remove(d.id); self.refresh() }
-        }
+        let on = !isPinned(d)
+        pinOverride[d.id] = on
+        perform([[on ? "pin" : "unpin", d.id]], done: [d.id])
     }
 
     func killAll() {
-        let ids = devices.map(\.id)
+        let ids = Set(devices.map(\.id))
         busy.formUnion(ids)
-        Task.detached {
-            for id in ids { run(["kill", id]) }
-            await MainActor.run { self.busy.removeAll(); self.refresh() }
-        }
+        perform(ids.map { ["kill", $0] }, done: ids)
     }
 
     /// The session currently holding the device; nil once it released it or went idle.
@@ -338,24 +339,7 @@ struct DeviceRow: View {
             }
             Spacer(minLength: 4)
             usageView
-            if store.busy.contains(device.id) {
-                ProgressView().controlSize(.small).frame(width: 70)
-            } else {
-                iconButton(device.pinned ? "pin.fill" : "pin",
-                           help: device.pinned ? L("Stop keeping alive", "Ne plus garder allumé") : L("Keep alive: never shut down automatically", "Garder allumé : jamais éteint automatiquement"),
-                           tint: device.pinned ? .accentColor : nil) { store.togglePin(device) }
-                if confirmKill {
-                    Button(L("Shut down?", "Éteindre ?")) { store.kill(device); confirmKill = false }
-                        .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
-                } else {
-                    iconButton("power", help: L("Shut down", "Éteindre")) {
-                        if device.live || device.pinned {
-                            confirmKill = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { confirmKill = false }
-                        } else { store.kill(device) }
-                    }
-                }
-            }
+            controls
         }
         .padding(.vertical, 3).padding(.horizontal, 8)
         .contextMenu {
@@ -365,12 +349,40 @@ struct DeviceRow: View {
         }
     }
 
+    /// Pin + power, in a fixed-size box: the spinner and the confirmation take exactly
+    /// their place, so nothing on the left moves.
+    var controls: some View {
+        let pinned = store.isPinned(device)
+        return ZStack {
+            HStack(spacing: 6) {
+                iconButton(pinned ? "pin.fill" : "pin",
+                           help: pinned ? L("Stop keeping alive", "Ne plus garder allumé") : L("Keep alive: never shut down automatically", "Garder allumé : jamais éteint automatiquement"),
+                           tint: pinned ? .accentColor : nil) { store.togglePin(device) }
+                    .offset(y: 1)   // the pin glyph sits high; lines it up with the power icon
+                iconButton(confirmKill ? "power.circle.fill" : "power",
+                           help: confirmKill ? L("Click again to shut down", "Cliquer encore pour éteindre") : L("Shut down", "Éteindre"),
+                           tint: confirmKill ? .red : nil) {
+                    if confirmKill || !(device.live || pinned) {
+                        confirmKill = false
+                        store.kill(device)
+                    } else {
+                        confirmKill = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { confirmKill = false }
+                    }
+                }
+            }
+            .opacity(store.busy.contains(device.id) ? 0 : 1)
+            if store.busy.contains(device.id) { ProgressView().controlSize(.small) }
+        }
+        .frame(width: 50, height: 22)
+    }
+
     @ViewBuilder func status(_ s: DesktopSession?) -> some View {
         if device.live {
             let mins = max(0, (Int(Date().timeIntervalSince1970) - device.lastActive) / 60)
             Text(s?.title ?? "Session \(device.session.prefix(8))").foregroundColor(.blue)
                 + Text(mins > 1 ? L(" · active \(mins) min ago", " · actif il y a \(mins) min") : "")
-        } else if device.pinned {
+        } else if store.isPinned(device) {
             Text(L("Kept alive", "Gardé allumé"))
         } else if device.isUnmanaged {
             Text(L("Unmanaged", "Hors sim-lease") + (device.shutdownInMin >= 0 ? L(" · shuts down in \(device.shutdownInMin) min", " · s'éteint dans \(device.shutdownInMin) min") : ""))
@@ -491,7 +503,7 @@ struct Panel: View {
 
     /// Summary of what is idle, with the bulk shutdown actions.
     var actionBar: some View {
-        let idleDevices = store.devices.filter { !$0.live && !$0.pinned }
+        let idleDevices = store.devices.filter { !$0.live && !store.isPinned($0) }
         let idle = idleDevices.count
         let used = store.devices.filter(\.live).count
         let idleMemory = idleDevices.reduce(UInt64(0)) { $0 + (store.usage[$1.usageKey]?.memory ?? 0) }
