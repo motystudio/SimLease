@@ -331,7 +331,7 @@ struct DeviceRow: View {
         HStack(spacing: 10) {
             Image(systemName: device.isIOS ? "iphone" : "smartphone")
                 .font(.system(size: 18))
-                .foregroundStyle(device.live ? Color.green : .secondary)
+                .foregroundStyle(device.live ? Color.blue : .secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.name.isEmpty ? device.id : device.name).font(.system(size: 13, weight: .medium))
