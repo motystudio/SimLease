@@ -388,7 +388,8 @@ struct DeviceRow: View {
     @ViewBuilder func status(_ s: DesktopSession?) -> some View {
         if device.live {
             let mins = max(0, (Int(Date().timeIntervalSince1970) - device.lastActive) / 60)
-            Text(L("Used by ", "Utilisé par ") + (s?.title ?? "session \(device.session.prefix(8))") + (mins > 1 ? L(" · active \(mins) min ago", " · actif il y a \(mins) min") : ""))
+            Text(s?.title ?? "Session \(device.session.prefix(8))").foregroundColor(.blue)
+                + Text(mins > 1 ? L(" · active \(mins) min ago", " · actif il y a \(mins) min") : "")
         } else if device.pinned {
             Text(L("Kept alive", "Gardé allumé"))
         } else if device.isUnmanaged {
