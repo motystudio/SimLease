@@ -259,6 +259,17 @@ struct DeviceRow: View {
     }
 }
 
+struct PillButtonStyle: ButtonStyle {
+    let tint: Color
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .foregroundStyle(tint)
+            .background(Capsule().fill(tint.opacity(configuration.isPressed ? 0.3 : 0.16)))
+            .contentShape(Capsule())
+    }
+}
+
 struct Panel: View {
     @EnvironmentObject var store: Store
 
@@ -268,49 +279,83 @@ struct Panel: View {
                 Text("Simulateurs").font(.headline)
                 Spacer()
                 if store.loading { ProgressView().controlSize(.mini) }
-                Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("Rafraîchir")
+                Button { store.refresh() } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 22, height: 22)
+                }
+                .buttonStyle(.borderless).help("Rafraîchir")
+                settingsMenu
             }
             .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
 
             if store.devices.isEmpty {
-                Text("Aucun simulateur démarré").foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity).padding(.vertical, 20)
+                VStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle").font(.system(size: 24)).foregroundStyle(.green)
+                    Text("Aucun simulateur démarré").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 24)
             } else {
                 section("iOS", store.devices.filter(\.isIOS))
                 section("Android", store.devices.filter { !$0.isIOS })
+                actionBar.padding(10)
             }
-
-            Divider().padding(.top, 4)
-            HStack {
-                Button("Éteindre les inactifs") { store.killIdle() }
-                    .disabled(!store.devices.contains { !$0.live })
-                Button("Tout éteindre", role: .destructive) { store.killAll() }
-                    .disabled(store.devices.isEmpty)
-            }
-            .controlSize(.small).padding(.horizontal, 12).padding(.vertical, 8)
-
-            Divider()
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("Nettoyage auto toutes les 5 min", isOn: $store.autoReap)
-                Toggle("Lancer à l'ouverture de session", isOn: Binding(
-                    get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
-            }
-            .toggleStyle(.checkbox).font(.system(size: 12))
-            .padding(.horizontal, 12).padding(.vertical, 8)
-
-            Divider()
-            HStack {
-                Button("Journal") { NSWorkspace.shared.open(URL(fileURLWithPath: "\(home)/.claude/sim-leases/sim-lease.log")) }
-                Spacer()
-                Button("Quitter") { NSApp.terminate(nil) }
-            }
-            .buttonStyle(.borderless).font(.system(size: 12))
-            .padding(.horizontal, 12).padding(.vertical, 8)
         }
         .frame(width: 400)
         .onAppear { store.refresh(); store.loadSessions() }
     }
+
+    var settingsMenu: some View {
+        Menu {
+            Toggle("Nettoyage auto toutes les 5 min", isOn: $store.autoReap)
+            Toggle("Lancer à l'ouverture de session", isOn: Binding(
+                get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
+            Divider()
+            Button("Ouvrir le journal") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "\(home)/.claude/sim-leases/sim-lease.log"))
+            }
+            Divider()
+            Button("Quitter SimBar") { NSApp.terminate(nil) }
+        } label: {
+            Image(systemName: "gearshape").frame(width: 22, height: 22)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Réglages")
+    }
+
+    /// Summary of what is idle, with the bulk shutdown actions.
+    var actionBar: some View {
+        let idle = store.devices.filter { !$0.live }.count
+        let used = store.devices.count - idle
+        return HStack(spacing: 10) {
+            Image(systemName: idle > 0 ? "moon.zzz.fill" : "checkmark.circle.fill")
+                .font(.system(size: 16))
+                .foregroundStyle(idle > 0 ? Color.orange : .green)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(idle > 0 ? plural(idle, "appareil inactif", "appareils inactifs") : "Tout est utilisé")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(used > 0 ? "\(plural(used, "utilisé", "utilisés")) par une session" : "Aucune session ne les utilise")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if idle > 0 {
+                Button { store.killIdle() } label: {
+                    Label("Éteindre", systemImage: "power").font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(PillButtonStyle(tint: .orange))
+                .help("Éteindre les appareils qu'aucune session n'utilise")
+            }
+            Menu {
+                Button(role: .destructive) { store.killAll() } label: {
+                    Label("Tout éteindre, même ceux utilisés (\(store.devices.count))", systemImage: "power")
+                }
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 20, height: 20)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.06)))
+    }
+
+    func plural(_ n: Int, _ one: String, _ many: String) -> String { "\(n) \(n > 1 ? many : one)" }
 
     @ViewBuilder func section(_ title: String, _ list: [Device]) -> some View {
         if !list.isEmpty {
@@ -355,8 +400,7 @@ struct SimBarApp: App {
             Panel().environmentObject(store)
         } label: {
             let n = store.devices.count
-            let idle = store.devices.filter { !$0.live }.count
-            Image(systemName: idle > 0 ? "iphone.badge.exclamationmark" : "iphone")
+            Image(systemName: "iphone")
             if n > 0 { Text("\(n)") }
         }
         .menuBarExtraStyle(.window)
