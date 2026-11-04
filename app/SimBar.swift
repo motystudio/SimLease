@@ -245,7 +245,9 @@ final class Store: ObservableObject {
         }
     }
 
+    /// The session currently holding the device; nil once it released it or went idle.
     func session(for d: Device) -> DesktopSession? {
+        guard d.live else { return nil }
         if let s = sessions[d.session] { return s }
         if !d.host.isEmpty { return sessions.values.first { $0.localId == d.host } }
         return nil

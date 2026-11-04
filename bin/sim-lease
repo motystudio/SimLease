@@ -209,7 +209,7 @@ release() { # [id] [session]  (device stays booted GRACE_MIN so the next session
   for id in $(leases); do
     [ "$(lget "$id" session)" = "$s" ] || continue
     [ -z "${1:-}" ] || [ "$id" = "$1" ] || continue
-    lwrite "$id" "$(lget "$id" platform)" "$(lget "$id" name)" none "$(now)" "$(lget "$id" host)"; log "release $id from $s"
+    lwrite "$id" "$(lget "$id" platform)" "$(lget "$id" name)" none "$(now)"; log "release $id from $s"
     echo "released $id"
   done
 }
