@@ -36,6 +36,7 @@ struct Usage: Equatable { var memory: UInt64 = 0; var cpu: Double? = nil; var ro
 final class Sampler: @unchecked Sendable {
     private let lock = NSLock()
     private var lastTimes: [String: UInt64] = [:]
+    private var lastCPU: [String: Double] = [:]
     private var lastDate: Date?
     private let ticksToNs: Double = {
         var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
@@ -85,12 +86,14 @@ final class Sampler: @unchecked Sendable {
             let wallNs = now.timeIntervalSince(last) * 1e9
             for (key, t) in times {
                 guard let prev = lastTimes[key], t >= prev else { continue }
-                result[key]?.cpu = Double(t - prev) * ticksToNs / wallNs * 100
+                lastCPU[key] = Double(t - prev) * ticksToNs / wallNs * 100
             }
             lastTimes = times; lastDate = now
         } else if lastDate == nil {
             lastTimes = times; lastDate = now
         }
+        // a sample taken right after another one reuses the last measurement
+        for key in result.keys { result[key]?.cpu = lastCPU[key] }
         return result
     }
 
@@ -332,7 +335,8 @@ struct DeviceRow: View {
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.name.isEmpty ? device.id : device.name).font(.system(size: 13, weight: .medium))
-                status(session).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                status(session).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
             usageView
