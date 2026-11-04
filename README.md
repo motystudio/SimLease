@@ -3,7 +3,13 @@
 Partage des simulateurs iOS et émulateurs Android entre plusieurs sessions Claude Code en parallèle, sans qu'ils s'accumulent.
 
 - **`bin/sim-lease`** : chaque session « loue » un appareil au lieu d'en démarrer un nouveau. Le script réutilise un appareil allumé et libre, n'en démarre un que sous un plafond, et éteint ceux qui ne servent plus.
-- **`app/SimBar.swift`** : app de barre des menus qui montre les appareils démarrés, quelle session les utilise (avec un bouton pour y aller), permet de les éteindre, et lance le nettoyage toutes les 5 min.
+- **`app/SimBar.swift`** : app de barre des menus (en anglais, en français si le système est en français) qui montre :
+  - les appareils démarrés, avec la RAM et le CPU de chacun ;
+  - quelle session les utilise, avec un bouton Claude pour y aller ;
+  - un clic sur une ligne affiche le simulateur (Android : la fenêtre de l'émulateur ; iOS : Simulator.app, ou DeviceHub depuis Xcode 27, qui ne permet pas de choisir l'appareil) ;
+  - un bouton pour éteindre, et une punaise pour **garder un appareil allumé** : il n'est alors jamais éteint automatiquement.
+
+  Elle lance aussi le nettoyage toutes les 5 min. Si l'icône est cachée dans la barre des menus, relancer l'app ouvre le panneau dans une fenêtre.
 
 ## Installation
 
@@ -27,6 +33,7 @@ Ajouter aussi le bloc `<simulators>` dans `~/.claude/CLAUDE.md` (voir `CLAUDE.sn
 | La session est active | Son appareil lui reste réservé (activité = date de modification du transcript de la session) |
 | La session ne fait rien depuis 20 min, ou appelle `release` | L'appareil reste allumé 10 min pour qu'une autre session le reprenne, puis il est éteint |
 | Appareil démarré hors sim-lease | Il est éteint après 30 min s'il n'est pas utilisé |
+| Appareil épinglé (`sim-lease pin ID`) | Jamais éteint automatiquement, seulement à la main |
 | Tous les appareils sont occupés | `acquire` renvoie le code 3 ; on réessaie avec `--wait 300` |
 
 Les appareils physiques ne sont jamais touchés.
@@ -51,6 +58,7 @@ sim-lease acquire ios|android [--name NAME] [--wait SECS]
 sim-lease release [ID]
 sim-lease status | json
 sim-lease kill ID
+sim-lease pin|unpin ID
 sim-lease shutdown-idle
 sim-lease reap
 ```

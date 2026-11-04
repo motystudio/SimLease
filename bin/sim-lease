@@ -12,6 +12,7 @@
 #   sim-lease status                show booted devices and their leases
 #   sim-lease shutdown-idle         shut down every booted device without a live lease, now
 #   sim-lease kill ID               shut down one device now
+#   sim-lease pin|unpin ID          keep a device alive: never shut down automatically
 #   sim-lease json                  booted devices + leases as JSON (menu bar app)
 #
 # Config (env or ~/.claude/sim-lease.conf):
@@ -63,7 +64,13 @@ lget() { grep -m1 "^$2=" "$DIR/$1" 2>/dev/null | cut -d= -f2-; }
 lwrite() { # id platform name session released_at [host_session]
   printf 'platform=%s\nname=%s\nsession=%s\nsince=%s\nreleased_at=%s\nhost=%s\n' "$2" "$3" "$4" "$(now)" "$5" "${6:-}" > "$DIR/$1"
 }
-leases() { ls "$DIR" 2>/dev/null | grep -v -e '^\.' -e '\.log$'; }
+leases() { ls "$DIR" 2>/dev/null | grep -v -e '^\.' -e '\.log$' -e '\.err$'; }
+
+# pinned devices are never shut down automatically (iOS: UDID, Android: AVD name,
+# since an emulator's serial changes on every boot)
+PINS="$DIR/.pinned"
+pin_key() { if [ "$2" = ios ]; then echo "$1"; else echo "${3:-$(lget "$1" name)}"; fi; }   # id platform [name]
+pinned() { [ -f "$PINS" ] && grep -qxF "$(pin_key "$@")" "$PINS"; }
 
 # last activity of a session = mtime of its transcript
 session_last_active() {
@@ -134,6 +141,7 @@ reap() {
     p=$(lget "$id" platform)
     booted "$p" | cut -f1 | grep -qx "$id" || { drop "$id"; continue; }   # already shut down
     lease_live "$id" && continue
+    pinned "$id" "$p" && continue
     s=$(lget "$id" session)
     case "$s" in
       none)      idle_since=$(lget "$id" released_at); grace=$GRACE_MIN ;;
@@ -222,11 +230,12 @@ status() {
 
 # one JSON object per booted device, for the menu bar app
 json() {
-  local p id name s live last ra grace left
+  local p id name s live last ra grace left pin
   for p in ios android; do
     booted "$p" | while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
       s=$(lget "$id" session); ra=$(lget "$id" released_at); last=0; left=-1
+      if pinned "$id" "$p" "$name"; then pin=true; else pin=false; fi
       case "$s" in ""|none|unmanaged) ;; *) last=$(session_last_active "$s") ;; esac
       if lease_live "$id"; then live=true; else
         live=false
@@ -237,12 +246,24 @@ json() {
           *)         left=$(( (last + (STALE_MIN+GRACE_MIN)*60 - $(now)) / 60 )) ;;
         esac
         [ "$left" -lt -1 ] && left=0
+        [ "$pin" = true ] && left=-1
       fi
       /usr/bin/jq -nc --arg p "$p" --arg id "$id" --arg name "$name" --arg s "$s" --arg host "$(lget "$id" host)" \
-        --argjson live "$live" --argjson last "$last" --argjson left "$left" \
-        '{platform:$p, id:$id, name:$name, session:$s, host:$host, live:$live, lastActive:$last, shutdownInMin:$left}'
+        --argjson live "$live" --argjson last "$last" --argjson left "$left" --argjson pin "$pin" \
+        '{platform:$p, id:$id, name:$name, session:$s, host:$host, live:$live, lastActive:$last, shutdownInMin:$left, pinned:$pin}'
     done
   done | /usr/bin/jq -s .
+}
+
+pin_dev() { # on|off id
+  local id="${2:?usage: sim-lease pin|unpin ID}" p=android name="" key
+  echo "$id" | grep -qE '^[0-9A-F-]{36}$' && p=ios
+  [ "$p" = android ] && name=$(android_booted | awk -F'\t' -v s="$id" '$1==s{print $2}')
+  key=$(pin_key "$id" "$p" "${name:-$id}")   # Android: accepts the serial or the AVD name
+  lock; touch "$PINS"
+  grep -vxF "$key" "$PINS" > "$PINS.tmp"; mv "$PINS.tmp" "$PINS"
+  if [ "$1" = on ]; then echo "$key" >> "$PINS"; log "pin $key"; echo "pinned $key"
+  else log "unpin $key"; echo "unpinned $key"; fi
 }
 
 kill_dev() { # id — shut down now, whoever holds it
@@ -257,7 +278,7 @@ shutdown_idle() {
   for p in ios android; do
     booted "$p" | while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
-      lease_live "$id" || shutdown_dev "$id" "$p"
+      lease_live "$id" || pinned "$id" "$p" "$name" || shutdown_dev "$id" "$p"
     done
   done
 }
@@ -273,6 +294,8 @@ case "$cmd" in
   status) status ;;
   json) json ;;
   kill) kill_dev "${1:-}" ;;
+  pin) pin_dev on "${1:-}" ;;
+  unpin) pin_dev off "${1:-}" ;;
   shutdown-idle) shutdown_idle ;;
-  *) sed -n '2,23p' "$0"; exit 1 ;;
+  *) sed -n '2,24p' "$0"; exit 1 ;;
 esac

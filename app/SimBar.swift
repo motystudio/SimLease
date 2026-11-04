@@ -21,10 +21,102 @@ struct Device: Identifiable, Decodable, Equatable {
     let live: Bool
     let lastActive: Int
     let shutdownInMin: Int
+    let pinned: Bool
 
     var isIOS: Bool { platform == "ios" }
     var isUnmanaged: Bool { session == "unmanaged" || session.isEmpty }
+    /// Key used by Sampler: iOS UDID, or AVD name for an emulator.
+    var usageKey: String { isIOS ? id : name }
 }
+
+struct Usage: Equatable { var memory: UInt64 = 0; var cpu: Double? = nil; var rootPid: pid_t = 0 }
+
+/// Measures memory (physical footprint, like Activity Monitor) and CPU of each simulator,
+/// summing every process under its `launchd_sim` (iOS) or its `qemu-system` process (Android).
+final class Sampler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastTimes: [String: UInt64] = [:]
+    private var lastDate: Date?
+    private let ticksToNs: Double = {
+        var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
+        return Double(tb.numer) / Double(tb.denom)
+    }()
+
+    func sample() -> [String: Usage] {
+        lock.lock(); defer { lock.unlock() }
+        var count = proc_listallpids(nil, 0)
+        var pids = [pid_t](repeating: 0, count: Int(count) + 64)
+        count = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+
+        var parent: [pid_t: pid_t] = [:], footprint: [pid_t: UInt64] = [:], time: [pid_t: UInt64] = [:]
+        var roots: [pid_t: String] = [:]
+        for p in pids.prefix(Int(max(count, 0))) where p > 0 {
+            var info = proc_bsdinfo()
+            if proc_pidinfo(p, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 {
+                parent[p] = pid_t(info.pbi_ppid)
+            }
+            var ru = rusage_info_v2()
+            let ok = withUnsafeMutablePointer(to: &ru) {
+                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(p, RUSAGE_INFO_V2, $0) }
+            }
+            if ok == 0 { footprint[p] = ru.ri_phys_footprint; time[p] = ru.ri_user_time + ru.ri_system_time }
+            let name = Sampler.name(p)
+            if name == "launchd_sim" || name.hasPrefix("qemu-system") {
+                let a = Sampler.args(p)
+                if let r = a.range(of: #"Devices/[0-9A-F-]{36}"#, options: .regularExpression) {
+                    roots[p] = String(a[r].dropFirst(8))
+                } else if let r = a.range(of: #"-avd [^ ]+"#, options: .regularExpression) {
+                    roots[p] = String(a[r].dropFirst(5))
+                }
+            }
+        }
+
+        var result: [String: Usage] = [:], times: [String: UInt64] = [:]
+        for (p, fp) in footprint {
+            var q = p, depth = 0
+            while roots[q] == nil, let pp = parent[q], pp > 1, depth < 64 { q = pp; depth += 1 }
+            guard let key = roots[q] else { continue }
+            result[key, default: Usage()].memory += fp
+            result[key]?.rootPid = q
+            times[key, default: 0] += time[p] ?? 0
+        }
+        let now = Date()
+        if let last = lastDate, now.timeIntervalSince(last) > 0.5 {
+            let wallNs = now.timeIntervalSince(last) * 1e9
+            for (key, t) in times {
+                guard let prev = lastTimes[key], t >= prev else { continue }
+                result[key]?.cpu = Double(t - prev) * ticksToNs / wallNs * 100
+            }
+            lastTimes = times; lastDate = now
+        } else if lastDate == nil {
+            lastTimes = times; lastDate = now
+        }
+        return result
+    }
+
+    private static func name(_ pid: pid_t) -> String {
+        var buf = [CChar](repeating: 0, count: 256)
+        proc_name(pid, &buf, UInt32(buf.count))
+        return String(cString: buf)
+    }
+
+    private static func args(_ pid: pid_t) -> String {
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid], size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return "" }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return "" }
+        return String(decoding: buf[4..<size].map { $0 == 0 ? 32 : $0 }, as: UTF8.self)
+    }
+}
+
+func formatMemory(_ bytes: UInt64) -> String {
+    let gb = Double(bytes) / 1_073_741_824
+    return gb >= 1 ? "\(gb.formatted(.number.precision(.fractionLength(1)))) \(L("GB", "Go"))" : "\(bytes / 1_048_576) \(L("MB", "Mo"))"
+}
+
+/// English by default, French when the system's first language is French.
+let isFrench = Locale.preferredLanguages.first?.hasPrefix("fr") ?? false
+func L(_ en: String, _ fr: String) -> String { isFrench ? fr : en }
 
 struct DesktopSession { let localId: String; let title: String; let cwd: String }
 
@@ -67,6 +159,7 @@ final class Store: ObservableObject {
     static let shared = Store()
 
     @Published var devices: [Device] = []
+    @Published var usage: [String: Usage] = [:]
     @Published var busy: Set<String> = []
     @Published var loading = false
     @Published var autoReap: Bool = UserDefaults.standard.object(forKey: "autoReap") as? Bool ?? true {
@@ -77,6 +170,7 @@ final class Store: ObservableObject {
     private var sessions: [String: DesktopSession] = [:]   // cliSessionId -> desktop session
     private var timer: Timer?
     private var lastReap = Date.distantPast
+    nonisolated private let sampler = Sampler()
 
     init() {
         refresh()
@@ -103,8 +197,10 @@ final class Store: ObservableObject {
         Task.detached {
             let data = run(["json"])
             let list = (try? JSONDecoder().decode([Device].self, from: data)) ?? []
+            let usage = self.sampler.sample()
             await MainActor.run {
                 if list != self.devices { self.devices = list }
+                if usage != self.usage { self.usage = usage }
                 self.loading = false
                 if list.contains(where: { !$0.isUnmanaged && $0.session != "none" && self.sessions[$0.session] == nil }) {
                     self.loadSessions()
@@ -122,10 +218,18 @@ final class Store: ObservableObject {
     }
 
     func killIdle() {
-        busy.formUnion(devices.filter { !$0.live }.map(\.id))
+        busy.formUnion(devices.filter { !$0.live && !$0.pinned }.map(\.id))
         Task.detached {
             run(["shutdown-idle"])
             await MainActor.run { self.busy.removeAll(); self.refresh() }
+        }
+    }
+
+    func togglePin(_ d: Device) {
+        busy.insert(d.id)
+        Task.detached {
+            run([d.pinned ? "unpin" : "pin", d.id])
+            await MainActor.run { self.busy.remove(d.id); self.refresh() }
         }
     }
 
@@ -158,17 +262,22 @@ final class Store: ObservableObject {
         }
     }
 
+    /// Brings the device's window forward. Android: the emulator's own window.
+    /// iOS: Simulator.app on that device; Xcode 27+ has DeviceHub instead, which can't be told which device to show.
     func show(_ d: Device) {
-        if d.isIOS {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            p.arguments = ["-a", "Simulator", "--args", "-CurrentDeviceUDID", d.id]
-            try? p.run()
-        } else {
-            // bring the emulator window of that AVD forward
-            for app in NSWorkspace.shared.runningApplications where (app.localizedName ?? "").contains("qemu") || (app.localizedName ?? "").hasPrefix("Android Emulator") {
+        if !d.isIOS {
+            if let pid = usage[d.usageKey]?.rootPid, pid > 0, let app = NSRunningApplication(processIdentifier: pid) {
                 app.activate()
             }
+            return
+        }
+        let ws = NSWorkspace.shared
+        if let sim = ws.urlForApplication(withBundleIdentifier: "com.apple.iphonesimulator") {
+            let config = NSWorkspace.OpenConfiguration()
+            config.arguments = ["-CurrentDeviceUDID", d.id]
+            ws.openApplication(at: sim, configuration: config)
+        } else if let hub = ws.urlForApplication(withBundleIdentifier: "com.apple.dt.Devices") {
+            ws.openApplication(at: hub, configuration: NSWorkspace.OpenConfiguration())
         }
     }
 
@@ -201,6 +310,18 @@ struct DeviceRow: View {
     @EnvironmentObject var store: Store
     let device: Device
     @State private var confirmKill = false
+    @State private var hovering = false
+
+    /// Claude logo (app/claude.svg), template so it follows the text color.
+    static let claudeImage: NSImage = {
+        let img = NSImage(contentsOf: Bundle.main.url(forResource: "claude", withExtension: "svg")!)!
+        img.isTemplate = true
+        return img
+    }()
+
+    var claudeIcon: some View {
+        Image(nsImage: DeviceRow.claudeImage).resizable().scaledToFit().frame(width: 15, height: 15)
+    }
 
     var body: some View {
         let session = store.session(for: device)
@@ -214,19 +335,30 @@ struct DeviceRow: View {
                 status(session).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 4)
+            usageView
             if store.busy.contains(device.id) {
-                ProgressView().controlSize(.small)
+                ProgressView().controlSize(.small).frame(width: 96)
             } else {
-                if let s = session {
-                    iconButton("arrow.up.forward.app", help: "Ouvrir la session « \(s.title) »") { store.open(s) }
+                HStack(spacing: 2) {
+                    if let s = session {
+                        Button { store.open(s) } label: {
+                            claudeIcon.frame(width: 22, height: 22)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(L("Open session “\(s.title)”", "Ouvrir la session « \(s.title) »"))
+                    } else {
+                        Color.clear.frame(width: 22, height: 22)   // keeps the columns aligned
+                    }
+                    iconButton(device.pinned ? "pin.fill" : "pin",
+                               help: device.pinned ? L("Stop keeping alive", "Ne plus garder allumé") : L("Keep alive: never shut down automatically", "Garder allumé : jamais éteint automatiquement"),
+                               tint: device.pinned ? .accentColor : nil) { store.togglePin(device) }
                 }
-                iconButton("macwindow", help: "Afficher le simulateur") { store.show(device) }
                 if confirmKill {
-                    Button("Éteindre ?") { store.kill(device); confirmKill = false }
+                    Button(L("Shut down?", "Éteindre ?")) { store.kill(device); confirmKill = false }
                         .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
                 } else {
-                    iconButton("power", help: "Éteindre") {
-                        if device.live {
+                    iconButton("power", help: L("Shut down", "Éteindre")) {
+                        if device.live || device.pinned {
                             confirmKill = true
                             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { confirmKill = false }
                         } else { store.kill(device) }
@@ -234,9 +366,16 @@ struct DeviceRow: View {
                 }
             }
         }
-        .padding(.vertical, 6).padding(.horizontal, 12)
+        .padding(.vertical, 6).padding(.horizontal, 8)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.primary.opacity(hovering ? 0.07 : 0)))
+        .padding(.horizontal, 4)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture { store.show(device) }
+        .help(L("Click to show the simulator", "Cliquer pour afficher le simulateur"))
         .contextMenu {
-            Button("Copier l'identifiant") {
+            Button(L("Copy identifier", "Copier l'identifiant")) {
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString(device.id, forType: .string)
             }
         }
@@ -245,17 +384,38 @@ struct DeviceRow: View {
     @ViewBuilder func status(_ s: DesktopSession?) -> some View {
         if device.live {
             let mins = max(0, (Int(Date().timeIntervalSince1970) - device.lastActive) / 60)
-            Text("Utilisé par \(s?.title ?? "session \(device.session.prefix(8))")" + (mins > 1 ? " · actif il y a \(mins) min" : ""))
+            Text(L("Used by ", "Utilisé par ") + (s?.title ?? "session \(device.session.prefix(8))") + (mins > 1 ? L(" · active \(mins) min ago", " · actif il y a \(mins) min") : ""))
+        } else if device.pinned {
+            Text(L("Kept alive", "Gardé allumé"))
         } else if device.isUnmanaged {
-            Text("Hors sim-lease" + (device.shutdownInMin >= 0 ? " · s'éteint dans \(device.shutdownInMin) min" : ""))
+            Text(L("Unmanaged", "Hors sim-lease") + (device.shutdownInMin >= 0 ? L(" · shuts down in \(device.shutdownInMin) min", " · s'éteint dans \(device.shutdownInMin) min") : ""))
         } else {
-            Text("Libre · s'éteint dans \(max(0, device.shutdownInMin)) min")
+            Text(L("Free · shuts down in \(max(0, device.shutdownInMin)) min", "Libre · s'éteint dans \(max(0, device.shutdownInMin)) min"))
         }
     }
 
-    func iconButton(_ name: String, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: name).font(.system(size: 13)).frame(width: 22, height: 22) }
-            .buttonStyle(.borderless).help(help)
+    /// RAM and CPU of the whole simulator (all its processes).
+    @ViewBuilder var usageView: some View {
+        if let u = store.usage[device.usageKey] {
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(formatMemory(u.memory))
+                    .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(u.memory >= 4 << 30 ? Color.orange : .primary)
+                Text(u.cpu.map { String(format: "%.0f %% CPU", $0) } ?? "— CPU")
+                    .font(.system(size: 10)).monospacedDigit()
+                    .foregroundStyle((u.cpu ?? 0) >= 50 ? Color.orange : .secondary)
+            }
+            .frame(width: 62, alignment: .trailing)
+            .help(L("Memory and CPU used by this simulator (all its processes)", "Mémoire et processeur utilisés par ce simulateur (tous ses processus)"))
+        }
+    }
+
+    func iconButton(_ name: String, help: String, tint: Color? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name).font(.system(size: 13)).frame(width: 22, height: 22)
+                .foregroundStyle(tint ?? .primary)
+        }
+        .buttonStyle(.borderless).help(help)
     }
 }
 
@@ -276,13 +436,13 @@ struct Panel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Simulateurs").font(.headline)
+                Text(L("Simulators", "Simulateurs")).font(.headline)
                 Spacer()
                 if store.loading { ProgressView().controlSize(.mini) }
                 Button { store.refresh() } label: {
                     Image(systemName: "arrow.clockwise").frame(width: 22, height: 22)
                 }
-                .buttonStyle(.borderless).help("Rafraîchir")
+                .buttonStyle(.borderless).help(L("Refresh", "Rafraîchir"))
                 settingsMenu
             }
             .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
@@ -290,7 +450,7 @@ struct Panel: View {
             if store.devices.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "checkmark.circle").font(.system(size: 24)).foregroundStyle(.green)
-                    Text("Aucun simulateur démarré").foregroundStyle(.secondary)
+                    Text(L("No simulator running", "Aucun simulateur démarré")).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 24)
             } else {
@@ -299,52 +459,55 @@ struct Panel: View {
                 actionBar.padding(10)
             }
         }
-        .frame(width: 400)
+        .frame(width: 460)
         .onAppear { store.refresh(); store.loadSessions() }
     }
 
     var settingsMenu: some View {
         Menu {
-            Toggle("Nettoyage auto toutes les 5 min", isOn: $store.autoReap)
-            Toggle("Lancer à l'ouverture de session", isOn: Binding(
+            Toggle(L("Auto cleanup every 5 min", "Nettoyage auto toutes les 5 min"), isOn: $store.autoReap)
+            Toggle(L("Launch at login", "Lancer à l'ouverture de session"), isOn: Binding(
                 get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
             Divider()
-            Button("Ouvrir le journal") {
+            Button(L("Open log", "Ouvrir le journal")) {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "\(home)/.claude/sim-leases/sim-lease.log"))
             }
             Divider()
-            Button("Quitter SimBar") { NSApp.terminate(nil) }
+            Button(L("Quit SimBar", "Quitter SimBar")) { NSApp.terminate(nil) }
         } label: {
             Image(systemName: "gearshape").frame(width: 22, height: 22)
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Réglages")
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help(L("Settings", "Réglages"))
     }
 
     /// Summary of what is idle, with the bulk shutdown actions.
     var actionBar: some View {
-        let idle = store.devices.filter { !$0.live }.count
-        let used = store.devices.count - idle
+        let idleDevices = store.devices.filter { !$0.live && !$0.pinned }
+        let idle = idleDevices.count
+        let used = store.devices.filter(\.live).count
+        let idleMemory = idleDevices.reduce(UInt64(0)) { $0 + (store.usage[$1.usageKey]?.memory ?? 0) }
         return HStack(spacing: 10) {
             Image(systemName: idle > 0 ? "moon.zzz.fill" : "checkmark.circle.fill")
                 .font(.system(size: 16))
                 .foregroundStyle(idle > 0 ? Color.orange : .green)
             VStack(alignment: .leading, spacing: 1) {
-                Text(idle > 0 ? plural(idle, "appareil inactif", "appareils inactifs") : "Tout est utilisé")
+                Text(idle > 0 ? plural(idle, L("idle device", "appareil inactif"), L("idle devices", "appareils inactifs")) : L("Everything is in use", "Tout est utilisé"))
                     .font(.system(size: 12, weight: .semibold))
-                Text(used > 0 ? "\(plural(used, "utilisé", "utilisés")) par une session" : "Aucune session ne les utilise")
+                Text(idle > 0 && idleMemory > 0 ? L("\(formatMemory(idleMemory)) of RAM to reclaim", "\(formatMemory(idleMemory)) de RAM à récupérer")
+                     : used > 0 ? L("\(used) used by a session", "\(plural(used, "utilisé", "utilisés")) par une session") : L("No session is using them", "Aucune session ne les utilise"))
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
             if idle > 0 {
                 Button { store.killIdle() } label: {
-                    Label("Éteindre", systemImage: "power").font(.system(size: 12, weight: .semibold))
+                    Label(L("Shut down", "Éteindre"), systemImage: "power").font(.system(size: 12, weight: .semibold))
                 }
                 .buttonStyle(PillButtonStyle(tint: .orange))
-                .help("Éteindre les appareils qu'aucune session n'utilise")
+                .help(L("Shut down devices no session is using", "Éteindre les appareils qu'aucune session n'utilise"))
             }
             Menu {
                 Button(role: .destructive) { store.killAll() } label: {
-                    Label("Tout éteindre, même ceux utilisés (\(store.devices.count))", systemImage: "power")
+                    Label(L("Shut down all, even in use (\(store.devices.count))", "Tout éteindre, même ceux utilisés (\(store.devices.count))"), systemImage: "power")
                 }
             } label: {
                 Image(systemName: "ellipsis").frame(width: 20, height: 20)
@@ -359,7 +522,9 @@ struct Panel: View {
 
     @ViewBuilder func section(_ title: String, _ list: [Device]) -> some View {
         if !list.isEmpty {
-            Text("\(title) · \(list.count)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            let memory = list.reduce(UInt64(0)) { $0 + (store.usage[$1.usageKey]?.memory ?? 0) }
+            Text("\(title) · \(list.count)" + (memory > 0 ? L(" · \(formatMemory(memory)) total", " · \(formatMemory(memory)) au total") : ""))
+                .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 .padding(.horizontal, 12).padding(.top, 6)
             ForEach(list) { DeviceRow(device: $0) }
         }
@@ -399,10 +564,28 @@ struct SimBarApp: App {
         MenuBarExtra {
             Panel().environmentObject(store)
         } label: {
-            let n = store.devices.count
-            Image(systemName: "iphone")
-            if n > 0 { Text("\(n)") }
+            Image(nsImage: menuBarIcon(count: store.devices.count))
         }
         .menuBarExtraStyle(.window)
     }
+}
+
+/// Icon + count drawn as one tight template image (an Image + Text label gets extra spacing).
+func menuBarIcon(count: Int) -> NSImage {
+    let symbol = NSImage(systemSymbolName: "iphone", accessibilityDescription: L("Simulators", "Simulateurs"))!
+        .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))!
+    let text = count > 0 ? NSAttributedString(string: "\(count)", attributes: [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.black,
+    ]) : nil
+    let gap: CGFloat = text == nil ? 0 : 2
+    let textSize = text?.size() ?? .zero
+    let size = NSSize(width: ceil(symbol.size.width + gap + textSize.width), height: max(symbol.size.height, textSize.height))
+    let image = NSImage(size: size, flipped: false) { _ in
+        symbol.draw(in: NSRect(x: 0, y: (size.height - symbol.size.height) / 2,
+                               width: symbol.size.width, height: symbol.size.height))
+        text?.draw(at: NSPoint(x: symbol.size.width + gap, y: (size.height - textSize.height) / 2))
+        return true
+    }
+    image.isTemplate = true
+    return image
 }
