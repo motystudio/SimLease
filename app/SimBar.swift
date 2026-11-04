@@ -64,6 +64,8 @@ func scanDesktopSessions() -> [String: DesktopSession] {
 
 @MainActor
 final class Store: ObservableObject {
+    static let shared = Store()
+
     @Published var devices: [Device] = []
     @Published var busy: Set<String> = []
     @Published var loading = false
@@ -319,9 +321,34 @@ struct Panel: View {
     }
 }
 
+/// Opening the app again (Spotlight, Finder, `open`) shows the panel in a normal window,
+/// for when the menu bar icon is hidden.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var window: NSWindow?
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        MainActor.assumeIsolated { showWindow() }
+        return false
+    }
+
+    @MainActor func showWindow() {
+        if window == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: Panel().environmentObject(Store.shared)))
+            w.title = "SimBar"
+            w.styleMask = [.titled, .closable, .miniaturizable]
+            w.isReleasedWhenClosed = false
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 @main
 struct SimBarApp: App {
-    @StateObject private var store = Store()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @ObservedObject private var store = Store.shared
 
     var body: some Scene {
         MenuBarExtra {
