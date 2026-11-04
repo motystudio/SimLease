@@ -35,7 +35,7 @@ struct Usage: Equatable { var memory: UInt64 = 0; var cpu: Double? = nil; var ro
 /// summing every process under its `launchd_sim` (iOS) or its `qemu-system` process (Android).
 final class Sampler: @unchecked Sendable {
     private let lock = NSLock()
-    private var lastTimes: [String: UInt64] = [:]
+    private var lastTimes: [pid_t: UInt64] = [:]   // per process, so an exiting process doesn't skew the total
     private var lastCPU: [String: Double] = [:]
     private var lastDate: Date?
     private let ticksToNs: Double = {
@@ -64,33 +64,37 @@ final class Sampler: @unchecked Sendable {
             let name = Sampler.name(p)
             if name == "launchd_sim" || name.hasPrefix("qemu-system") {
                 let a = Sampler.args(p)
-                if let r = a.range(of: #"Devices/[0-9A-F-]{36}"#, options: .regularExpression) {
-                    roots[p] = String(a[r].dropFirst(8))
-                } else if let r = a.range(of: #"-avd [^ ]+"#, options: .regularExpression) {
-                    roots[p] = String(a[r].dropFirst(5))
+                if let m = a.firstMatch(of: #/Devices\/([0-9A-F-]{36})/#) {
+                    roots[p] = String(m.1)
+                } else if let m = a.firstMatch(of: #/(?:^| )(?:-avd |@)([^ ]+)/#) {   // `-avd NAME` or `@NAME`
+                    roots[p] = String(m.1)
                 }
             }
         }
 
-        var result: [String: Usage] = [:], times: [String: UInt64] = [:]
+        var result: [String: Usage] = [:], keyOf: [pid_t: String] = [:]
         for (p, fp) in footprint {
             var q = p, depth = 0
             while roots[q] == nil, let pp = parent[q], pp > 1, depth < 64 { q = pp; depth += 1 }
             guard let key = roots[q] else { continue }
             result[key, default: Usage()].memory += fp
             result[key]?.rootPid = q
-            times[key, default: 0] += time[p] ?? 0
+            keyOf[p] = key
         }
         let now = Date()
-        if let last = lastDate, now.timeIntervalSince(last) > 0.5 {
-            let wallNs = now.timeIntervalSince(last) * 1e9
-            for (key, t) in times {
-                guard let prev = lastTimes[key], t >= prev else { continue }
-                lastCPU[key] = Double(t - prev) * ticksToNs / wallNs * 100
+        if lastDate == nil || now.timeIntervalSince(lastDate!) > 0.5 {
+            if let last = lastDate {
+                // CPU time each process used since the last sample; new processes start counting next time
+                let wallNs = now.timeIntervalSince(last) * 1e9
+                var ticks: [String: UInt64] = [:]
+                for (p, key) in keyOf {
+                    guard let t = time[p], let prev = lastTimes[p], t >= prev else { continue }
+                    ticks[key, default: 0] += t - prev
+                }
+                lastCPU = ticks.mapValues { Double($0) * ticksToNs / wallNs * 100 }   // drops devices that are gone
             }
-            lastTimes = times; lastDate = now
-        } else if lastDate == nil {
-            lastTimes = times; lastDate = now
+            lastTimes = time.filter { keyOf[$0.key] != nil }
+            lastDate = now
         }
         // a sample taken right after another one reuses the last measurement
         for key in result.keys { result[key]?.cpu = lastCPU[key] }
@@ -174,7 +178,11 @@ final class Store: ObservableObject {
     private var sessions: [String: DesktopSession] = [:]   // cliSessionId -> desktop session
     private var timer: Timer?
     private var lastReap = Date.distantPast
+    private var lastSessionScan = Date.distantPast
+    private var pending = 0
     nonisolated private let sampler = Sampler()
+    /// sim-lease commands run one at a time, in click order (pin before a bulk shutdown, etc.)
+    nonisolated private let queue = DispatchQueue(label: "com.motystudio.simbar.commands")
 
     init() {
         refresh()
@@ -190,7 +198,7 @@ final class Store: ObservableObject {
     private func tick() {
         if autoReap, Date().timeIntervalSince(lastReap) >= 300 {
             lastReap = Date()
-            Task.detached { run(["reap"]); await MainActor.run { self.refresh() } }
+            perform([["reap"]])
         } else {
             refresh()
         }
@@ -198,25 +206,36 @@ final class Store: ObservableObject {
 
     func refresh() { perform([]) }
 
-    /// Runs sim-lease commands in the background, reloads the list, and only then clears
+    /// Runs sim-lease commands on the serial queue, reloads the list, and only then clears
     /// `done` from busy / pin overrides, so the row never flickers back to its old state.
+    /// Results are applied in the order the work was queued.
     private func perform(_ commands: [[String]], done ids: Set<String> = []) {
+        pending += 1
         loading = true
-        Task.detached {
+        let sampler = self.sampler
+        queue.async {
             for c in commands { run(c) }
             let data = run(["json"])
             let list = (try? JSONDecoder().decode([Device].self, from: data)) ?? []
-            let usage = self.sampler.sample()
-            await MainActor.run {
-                if list != self.devices { self.devices = list }
-                if usage != self.usage { self.usage = usage }
-                self.busy.subtract(ids)
-                for id in ids { self.pinOverride.removeValue(forKey: id) }
-                self.loading = false
-                if list.contains(where: { !$0.isUnmanaged && $0.session != "none" && self.sessions[$0.session] == nil }) {
-                    self.loadSessions()
-                }
+            let usage = sampler.sample()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self.apply(list, usage, done: ids) }
             }
+        }
+    }
+
+    private func apply(_ list: [Device], _ usage: [String: Usage], done ids: Set<String>) {
+        if list != devices { devices = list }
+        if usage != self.usage { self.usage = usage }
+        busy.subtract(ids)
+        for id in ids { pinOverride.removeValue(forKey: id) }
+        pending -= 1
+        loading = pending > 0
+        // a session missing from the desktop app's metadata (e.g. a terminal session) is
+        // looked up again at most once a minute, not on every refresh
+        if Date().timeIntervalSince(lastSessionScan) >= 60,
+           list.contains(where: { $0.live && sessions[$0.session] == nil }) {
+            loadSessions()
         }
     }
 
@@ -256,6 +275,7 @@ final class Store: ObservableObject {
 
     /// Reads the desktop app's session metadata to map CLI session ids to titles / deep links.
     func loadSessions() {
+        lastSessionScan = Date()
         Task.detached {
             let map = scanDesktopSessions()
             await MainActor.run { self.sessions = map; self.objectWillChange.send() }
@@ -372,6 +392,7 @@ struct DeviceRow: View {
                 }
             }
             .opacity(store.busy.contains(device.id) ? 0 : 1)
+            .allowsHitTesting(!store.busy.contains(device.id))
             if store.busy.contains(device.id) { ProgressView().controlSize(.small) }
         }
         .frame(width: 50, height: 22)

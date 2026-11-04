@@ -3,7 +3,8 @@
 #
 # Each session leases a device instead of booting a fresh one. A lease stays alive
 # while the owning session's transcript keeps changing; idle/released devices are
-# shut down by `sim-lease reap` (run every few minutes by launchd + on SessionEnd).
+# shut down by `sim-lease reap`, which SimBar runs every 5 minutes and every `acquire`
+# runs first. A SessionEnd hook calls `release-session`.
 #
 #   sim-lease acquire ios|android [--name NAME] [--wait SECS]   -> prints UDID / adb serial
 #   sim-lease release [ID]          release this session's lease(s) (device kept warm for reuse)
@@ -72,9 +73,16 @@ PINS="$DIR/.pinned"
 pin_key() { if [ "$2" = ios ]; then echo "$1"; else echo "${3:-$(lget "$1" name)}"; fi; }   # id platform [name]
 pinned() { [ -f "$PINS" ] && grep -qxF "$(pin_key "$@")" "$PINS"; }
 
-# last activity of a session = mtime of its transcript
+# last activity of a session = mtime of its transcript. Finding the transcript means
+# globbing every project folder, so its path is cached in $DIR/.transcripts.
+TRANSCRIPTS="$DIR/.transcripts"
 session_last_active() {
-  local f; f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)
+  local f
+  f=$(awk -v s="$1" '$1==s {print substr($0, length(s)+2); exit}' "$TRANSCRIPTS" 2>/dev/null)
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)
+    [ -n "$f" ] && printf '%s %s\n' "$1" "$f" >> "$TRANSCRIPTS"
+  fi
   if [ -n "$f" ]; then stat -f %m "$f"; else echo 0; fi
 }
 lease_live() { # id -> 0 if held by an active session
@@ -94,9 +102,11 @@ android_booted() { # "serial<TAB>avd"  (emulators only, physical devices are nev
   done
 }
 booted() { if [ "$1" = ios ]; then ios_booted; else android_booted; fi; }
-shutdown_dev() { # id platform
-  if [ "$2" = ios ]; then xcrun simctl shutdown "$1" >/dev/null 2>&1
-  else "$ADB" -s "$1" emu kill >/dev/null 2>&1; fi
+shutdown_dev() { # id platform  (keeps the lease if the device didn't actually stop)
+  local ok=0
+  if [ "$2" = ios ]; then xcrun simctl shutdown "$1" >/dev/null 2>&1 || ok=$?
+  else "$ADB" -s "$1" emu kill >/dev/null 2>&1 || ok=$?; fi
+  if [ "$ok" -ne 0 ]; then log "shutdown FAILED $2 $1 (exit $ok)"; return 1; fi
   drop "$1"; log "shutdown $2 $1"
 }
 
@@ -269,7 +279,7 @@ pin_dev() { # on|off id
 kill_dev() { # id — shut down now, whoever holds it
   local id="${1:?usage: sim-lease kill ID}" p=android
   echo "$id" | grep -qE '^[0-9A-F-]{36}$' && p=ios
-  lock; shutdown_dev "$id" "$p"; echo "shut down $id"
+  lock; shutdown_dev "$id" "$p" || die "could not shut down $id"; echo "shut down $id"
 }
 
 shutdown_idle() {
@@ -297,5 +307,5 @@ case "$cmd" in
   pin) pin_dev on "${1:-}" ;;
   unpin) pin_dev off "${1:-}" ;;
   shutdown-idle) shutdown_idle ;;
-  *) sed -n '2,24p' "$0"; exit 1 ;;
+  *) sed -n '2,25p' "$0"; exit 1 ;;
 esac
