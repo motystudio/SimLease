@@ -653,25 +653,24 @@ struct Panel: View {
             Toggle(L("Auto cleanup every 5 min", "Nettoyage auto toutes les 5 min"), isOn: $store.autoReap)
             Toggle(L("Launch at login", "Lancer à l'ouverture de session"), isOn: Binding(
                 get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
-            Divider()
-            Section(L("Setup", "Installation")) {
-                ForEach(SetupItem.allCases, id: \.self) { item in
-                    switch store.setupStates[item] ?? .ok {
-                    case .ok:
-                        Label(L("\(item.title) installed", "\(item.title) installé"), systemImage: "checkmark.circle.fill")
-                    case .missing:
-                        Button { store.install([item]) } label: {
-                            Label(L("Install \(item.title)", "Installer : \(item.title)"), systemImage: "exclamationmark.triangle.fill")
-                        }
-                    case .outdated:
-                        Button { store.install([item]) } label: {
-                            Label(L("Update \(item.title)", "Mettre à jour : \(item.title)"), systemImage: "arrow.triangle.2.circlepath")
+            // only what still needs installing; the whole section disappears once everything is set up
+            let todo = SetupItem.allCases.filter { (store.setupStates[$0] ?? .ok) != .ok }
+            if !todo.isEmpty {
+                Divider()
+                Section(L("Setup", "Installation")) {
+                    ForEach(todo, id: \.self) { item in
+                        if store.setupStates[item] == .outdated {
+                            Button { store.install([item]) } label: {
+                                Label(L("Update \(item.title)", "Mettre à jour : \(item.title)"), systemImage: "arrow.triangle.2.circlepath")
+                            }
+                        } else {
+                            Button { store.install([item]) } label: {
+                                Label(L("Install \(item.title)", "Installer : \(item.title)"), systemImage: "exclamationmark.triangle.fill")
+                            }
                         }
                     }
-                }
-                if store.setupIncomplete {
-                    Button(L("Install everything", "Tout installer")) {
-                        store.install(SetupItem.allCases.filter { store.setupStates[$0] != .ok })
+                    if todo.count > 1 {
+                        Button(L("Install everything", "Tout installer")) { store.install(todo) }
                     }
                 }
             }
