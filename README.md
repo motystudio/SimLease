@@ -1,60 +1,60 @@
 # SimLease
 
-Partage des simulateurs iOS et émulateurs Android entre plusieurs sessions Claude Code en parallèle, sans qu'ils s'accumulent.
+Share iOS simulators and Android emulators between parallel Claude Code sessions, without them piling up.
 
-- **`bin/sim-lease`** : chaque session « loue » un appareil au lieu d'en démarrer un nouveau. Le script réutilise un appareil allumé et libre, n'en démarre un que sous un plafond, et éteint ceux qui ne servent plus.
-- **`app/SimBar.swift`** : app de barre des menus (en anglais, en français si le système est en français) qui montre :
-  - les appareils démarrés, avec la RAM et le CPU de chacun ;
-  - quelle session les utilise : un clic sur le nom et la description ouvre cette session ;
-  - un clic sur l'icône du téléphone affiche le simulateur (Android : la fenêtre de l'émulateur ; iOS : Simulator.app, ou DeviceHub depuis Xcode 27, qui ne permet pas de choisir l'appareil) ;
-  - un bouton pour éteindre, et une punaise pour **garder un appareil allumé** : il n'est alors jamais éteint automatiquement.
+- **`bin/sim-lease`**: each session "leases" a device instead of booting a new one. The script reuses an idle booted device, boots a new one only under a cap, and shuts down devices nobody is using.
+- **`app/SimBar.swift`**: a menu bar app (in English, or French if that is the system's first language) that shows:
+  - the booted devices, with the RAM and CPU of each one;
+  - which session is using them: clicking the name and description opens that session;
+  - clicking the phone icon shows the simulator (Android: the emulator's window; iOS: Simulator.app, or DeviceHub since Xcode 27, which can't be told which device to show);
+  - a button to shut a device down, and a pin to **keep a device alive**: it is then never shut down automatically.
 
-  Elle lance aussi le nettoyage toutes les 5 min. Si l'icône est cachée dans la barre des menus, relancer l'app ouvre le panneau dans une fenêtre.
+  It also runs the cleanup every 5 minutes. If its icon is hidden in the menu bar, launching the app again opens the panel in a window.
 
 ## Installation
 
 ```bash
-./build.sh          # installe ~/.claude/bin/sim-lease (copie) et ~/Applications/SimBar.app
+./build.sh          # installs ~/.claude/bin/sim-lease (a copy) and ~/Applications/SimBar.app
 open ~/Applications/SimBar.app
 ```
 
-Ensuite, dans SimBar, **⚙ → Setup** indique si le script, la règle `<simulators>` de `~/.claude/CLAUDE.md` et le hook `SessionEnd` sont installés et à jour, et les installe en un clic (un point orange sur la roue signale qu'il manque quelque chose). L'app embarque sa propre copie de `bin/sim-lease` et de `CLAUDE.snippet.md`. Le hook est ajouté avec `jq` en gardant le reste de `settings.json` intact, et une sauvegarde est faite dans `settings.json.backup-simbar`.
+Then, in SimBar, **⚙ → Setup** lists whichever of these is missing or out of date, and installs it in one click: the script, the `<simulators>` rule in `~/.claude/CLAUDE.md`, and the `SessionEnd` hook. An orange dot on the gear means something is missing; the section is hidden when everything is in place. The app bundles its own copy of `bin/sim-lease` and `CLAUDE.snippet.md`. The hook is added with `jq`, leaving the rest of `settings.json` untouched, and a backup is saved as `settings.json.backup-simbar`.
 
-À la main, le hook correspond à :
+To add the hook by hand, append this to `hooks.SessionEnd`:
 
 ```json
 { "hooks": [{ "type": "command", "command": "$HOME/.claude/bin/sim-lease release-session", "timeout": 30 }] }
 ```
 
-Relancer `./build.sh` après chaque modification de `bin/sim-lease`. C'est une copie et pas un lien symbolique : sinon macOS demande à SimBar l'accès au dossier Documents.
+Run `./build.sh` again after every change to `bin/sim-lease`. The installed script is a copy rather than a symlink because a link into `~/Documents` makes macOS ask SimBar for access to the Documents folder.
 
-## Fonctionnement
+## How it works
 
-| Situation | Ce qui se passe |
+| Situation | What happens |
 |---|---|
-| Une session appelle `sim-lease acquire ios` | Elle récupère son appareil si elle en a déjà un, sinon un appareil allumé et libre, sinon un nouveau (si on est sous le plafond) |
-| La session est active | Son appareil lui reste réservé (activité = date de modification du transcript de la session) |
-| La session ne fait rien depuis 20 min, ou appelle `release` | L'appareil reste allumé 10 min pour qu'une autre session le reprenne, puis il est éteint |
-| Appareil démarré hors sim-lease | Il est éteint après 30 min s'il n'est pas utilisé |
-| Appareil épinglé (`sim-lease pin ID`) | Jamais éteint automatiquement, seulement à la main |
-| Tous les appareils sont occupés | `acquire` renvoie le code 3 ; on réessaie avec `--wait 300` |
+| A session calls `sim-lease acquire ios` | It gets the device it already holds, otherwise an idle booted device, otherwise a new one (if under the cap) |
+| The session is active | Its device stays reserved for it (activity = last modification of the session's transcript) |
+| The session has been idle for 20 min, or calls `release` | The device stays on for 10 min so another session can reuse it, then it is shut down |
+| A device was booted outside sim-lease | It is shut down after 30 min unless a session leases it |
+| A device is pinned (`sim-lease pin ID`) | It is never shut down automatically, only by hand |
+| Every device is busy | `acquire` exits with code 3; retry with `--wait 300` |
 
-Les appareils physiques ne sont jamais touchés.
+Physical devices are never touched.
 
-## Réglages
+## Settings
 
-Dans `~/.claude/sim-lease.conf` :
+In `~/.claude/sim-lease.conf`:
 
 ```bash
 SIM_LEASE_MAX_IOS=3
 SIM_LEASE_MAX_ANDROID=2
 SIM_LEASE_STALE_MIN=20
 SIM_LEASE_GRACE_MIN=10
-SIM_LEASE_ADOPT_UNMANAGED=1        # 0 = ne jamais éteindre les appareils lancés à la main
+SIM_LEASE_ADOPT_UNMANAGED=1        # 0 = never shut down devices started by hand
 SIM_LEASE_UNMANAGED_GRACE_MIN=30
 ```
 
-## Commandes
+## Commands
 
 ```
 sim-lease acquire ios|android [--name NAME] [--wait SECS]
@@ -66,4 +66,4 @@ sim-lease shutdown-idle
 sim-lease reap
 ```
 
-Debug de l'app : `SimBar --setup DOSSIER` teste l'installation dans un faux `~/.claude`, et `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` dessine le panneau avec les vraies données (certains boutons y apparaissent comme des carrés jaunes, c'est une limite d'`ImageRenderer`).
+App debugging: `SimBar --setup DIR` tests the installation against a stand-in for `~/.claude`, and `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data (some buttons show up as yellow squares, which is an `ImageRenderer` limitation).
