@@ -58,6 +58,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>NSHumanReadableCopyright</key><string>Copyright © $(date +%Y) Moty Studio LLC.</string>
   <key>SUFeedURL</key><string>$FEED_URL</string>
   <key>SUEnableAutomaticChecks</key><true/>
@@ -78,6 +79,16 @@ plutil -lint -s "$APP/Contents/Info.plist"
 # --- resources and frameworks ----------------------------------------------------------------
 # what SimBar's Setup menu installs into ~/.claude
 cp bin/sim-lease CLAUDE.snippet.md "$APP/Contents/Resources/"
+
+# app icon: every size macOS asks for, from the 1024 px master
+ICONSET=build/obj/AppIcon.iconset
+rm -rf "$ICONSET" && mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+  sips -z $s $s packaging/icon/AppIcon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s*2)) $((s*2)) packaging/icon/AppIcon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+
 ditto "$SPARKLE_DIR/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 
 # --- signing, inside-out (no --deep), as Sparkle documents for builds outside Xcode -----------

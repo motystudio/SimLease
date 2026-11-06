@@ -111,7 +111,7 @@ struct WelcomeStep: View {
     var body: some View {
         VStack(spacing: 0) {
             Spacer()
-            IconBadge(symbol: "iphone.gen3", tint: .blue, size: 96)
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 128, height: 128)
             Text(L("Welcome to SimBar", "Bienvenue dans SimBar")).font(.largeTitle.weight(.semibold)).padding(.top, 22)
             VStack(spacing: 6) {
                 Text(L("Parallel Claude Code sessions share iOS simulators and Android emulators instead of each booting its own.",
