@@ -119,12 +119,14 @@ sim-lease help                       print this list
 
 The script only helps if sessions call it. The setup assistant installs two things for that:
 
-- **The `<simulators>` rule** in `~/.claude/CLAUDE.md` tells every session never to boot a simulator or emulator itself, to get one with `sim-lease acquire`, to use only that device ID, and to run `sim-lease release` when done. The text is in [CLAUDE.snippet.md](CLAUDE.snippet.md); you can paste it yourself instead.
+- **The `<simulators>` rule** in `~/.claude/CLAUDE.md` tells every session never to boot a simulator or emulator itself, to get one with `sim-lease acquire`, to use only that device ID, and to run `sim-lease release` when done. The text is in [CLAUDE.snippet.md](CLAUDE.snippet.md); you can paste it yourself instead. SimBar adds a `<!-- simbar-rule … -->` line inside the block so it can tell its own text from yours: a block you edited is never replaced without asking.
 - **The `SessionEnd` hook** in `~/.claude/settings.json` releases a session's devices when it ends, for sessions that forget. To add it by hand, append this entry to `hooks.SessionEnd`:
 
   ```json
-  { "hooks": [{ "type": "command", "command": "$HOME/.claude/bin/sim-lease release-session", "timeout": 30 }] }
+  { "hooks": [{ "type": "command", "command": "\"$HOME/.claude/bin/sim-lease\" release-session", "timeout": 30 }] }
   ```
+
+Both files are followed through symlinks, so dotfiles setups keep working, and SimBar saves the previous version next to them (`CLAUDE.md.backup-simbar`, `settings.json.backup-simbar`) whenever it changes one.
 
 Even without the hook, a device is freed once its session has been idle for `SIM_LEASE_STALE_MIN` minutes.
 
@@ -168,7 +170,7 @@ The app bundles its own copies of `bin/sim-lease` and `CLAUDE.snippet.md`, which
 
 Debug flags:
 
-- `SimBar --setup DIR` runs the installation check and install against `DIR`, a stand-in for `~/.claude`, then exits.
+- `SimBar --setup DIR` runs the installation check and install against `DIR`, a stand-in for `~/.claude`, then exits. Add `--replace-rule` to also replace a customized or malformed `<simulators>` block, as the confirmation dialog does.
 - `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data to a PNG and exits. Add `--view settings` or `--view onboarding-1` … `onboarding-5` to render another window, `--sim-lease PATH` to use another script, and `--claude-dir DIR` to check a stand-in for `~/.claude`.
 
 Releases are cut with `scripts/release.sh`: it builds the app, signs it with a Developer ID, notarizes it, and publishes the zip that GitHub Releases, Sparkle updates and the Homebrew cask all point to. The script documents its steps and the credentials it expects.
