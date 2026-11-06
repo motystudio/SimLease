@@ -110,6 +110,7 @@ sim-lease config [json]              show the configuration
 sim-lease config set KEY VALUE       change a setting
 sim-lease config reset [KEY]         reset one setting, or all of them
 sim-lease version                    print the version
+sim-lease help                       print this list
 ```
 
 `acquire` must run inside a Claude Code session: it identifies the session with `CLAUDE_CODE_SESSION_ID`. `--name` takes a simulator name or UDID on iOS, an AVD name on Android. Exit code 3 means every device of that platform is in use.

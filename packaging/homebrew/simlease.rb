@@ -30,7 +30,7 @@ cask "simlease" do
   ]
 
   caveats <<~EOS
-    Open SimBar once to finish the setup: in its panel, the gear menu > Setup installs
+    Open SimBar once to finish the setup: its setup assistant installs
     ~/.claude/bin/sim-lease, the <simulators> rule in ~/.claude/CLAUDE.md and the
     SessionEnd hook that releases a session's devices.
       open -a SimBar
