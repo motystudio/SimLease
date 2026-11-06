@@ -230,7 +230,7 @@ final class Store: ObservableObject {
     }
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var setupStates: [SetupItem: SetupState] = [:]
-    var setupIncomplete: Bool { setupStates.values.contains { $0 != .ok } }
+    var setupIncomplete: Bool { setupStates.values.contains { !$0.isInstalled } }
     /// Debug: `--claude-dir DIR` checks (and installs into) a stand-in for ~/.claude.
     nonisolated let setup = Setup(claudeDir: argument("--claude-dir") ?? "\(home)/.claude")
 
@@ -367,13 +367,13 @@ final class Store: ObservableObject {
 
     /// Installs the given setup items on the command queue, then reloads. `completion` gets the
     /// error message of each item that failed (empty when all went well); without one, a
-    /// failure is shown in an alert.
-    func install(_ items: [SetupItem], completion: (([SetupItem: String]) -> Void)? = nil) {
+    /// failure is shown in an alert. `replacingRule`: see `Setup.install`.
+    func install(_ items: [SetupItem], replacingRule: Bool = false, completion: (([SetupItem: String]) -> Void)? = nil) {
         let setup = self.setup
         queue.async {
             var failures: [SetupItem: String] = [:]
             for item in items {
-                do { try setup.install(item) } catch { failures[item] = error.localizedDescription }
+                do { try setup.install(item, replacingRule: replacingRule) } catch { failures[item] = error.localizedDescription }
             }
             let result = failures
             DispatchQueue.main.async {
@@ -395,12 +395,36 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Debug: `SimBar --setup DIR` checks, installs into DIR (a stand-in for ~/.claude), checks again, exits.
+    /// Replaces a customized or malformed CLAUDE.md rule with the bundled one, once the user
+    /// confirms. `completion` gets the error message, nil when it worked; it isn't called on cancel.
+    func confirmReplaceRule(completion: ((String?) -> Void)? = nil) {
+        let malformed = setupStates[.rule] == .malformed
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = malformed ? L("Fix the CLAUDE.md rule?", "Réparer la règle CLAUDE.md ?")
+                                      : L("Replace your rule with the default one?", "Remplacer votre règle par celle par défaut ?")
+        alert.informativeText = (malformed
+            ? L("The <simulators> section in ~/.claude/CLAUDE.md has no closing </simulators> tag. SimBar will replace it, up to the next section tag or the end of the file, with the default rule.",
+                "La section <simulators> de ~/.claude/CLAUDE.md n'a pas de balise de fermeture </simulators>. SimBar va la remplacer, jusqu'à la balise de section suivante ou la fin du fichier, par la règle par défaut.")
+            : L("The <simulators> section in ~/.claude/CLAUDE.md was edited, so SimBar doesn't update it. Replacing it discards your changes.",
+                "La section <simulators> de ~/.claude/CLAUDE.md a été modifiée, donc SimBar ne la met pas à jour. La remplacer efface vos modifications."))
+            + "\n\n" + L("The previous file is saved as CLAUDE.md\(Setup.backupSuffix).",
+                          "L'ancien fichier est enregistré sous CLAUDE.md\(Setup.backupSuffix).")
+        alert.addButton(withTitle: malformed ? L("Fix", "Réparer") : L("Replace", "Remplacer"))
+        alert.addButton(withTitle: L("Cancel", "Annuler"))
+        NSApp.activate()
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        install([.rule], replacingRule: true, completion: completion.map { done in { done($0[.rule]) } })
+    }
+
+    /// Debug: `SimBar --setup DIR [--replace-rule]` checks, installs into DIR (a stand-in for ~/.claude),
+    /// checks again, exits. `--replace-rule` also replaces a customized or malformed rule.
     private static func setupTest(claudeDir: String) -> Never {
         let s = Setup(claudeDir: claudeDir)
         for item in SetupItem.allCases { print("before", item, s.state(item)) }
+        let replacingRule = CommandLine.arguments.contains("--replace-rule")   // as if confirmed
         for item in SetupItem.allCases {
-            do { try s.install(item) } catch { print("install", item, "failed:", error) }
+            do { try s.install(item, replacingRule: replacingRule) } catch { print("install", item, "failed:", error) }
         }
         for item in SetupItem.allCases { print("after", item, s.state(item)) }
         exit(0)
