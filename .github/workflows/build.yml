@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # CFBundleVersion is the commit count
+
+      - name: Cache Sparkle
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: sparkle-${{ hashFiles('scripts/sparkle.sh') }}
+
+      - name: Lint shell scripts
+        run: |
+          for f in bin/sim-lease build.sh scripts/*.sh; do bash -n "$f"; done
+          if command -v shellcheck >/dev/null; then
+            shellcheck -S warning bin/sim-lease build.sh scripts/*.sh
+          fi
+
+      - name: Check cask syntax
+        run: ruby -c packaging/homebrew/simlease.rb
+
+      - name: Build (ad-hoc signed)
+        run: ./build.sh
+
+      - name: Inspect
+        run: |
+          lipo -info build/SimBar.app/Contents/MacOS/SimBar
+          plutil -lint build/SimBar.app/Contents/Info.plist
+          codesign --verify --strict --deep --verbose=2 build/SimBar.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SimBar-adhoc
+          path: build/SimBar.app
+          retention-days: 7
