@@ -8,7 +8,7 @@
 #
 # Environment:
 #   SIMBAR_SIGN_IDENTITY  "Developer ID Application: Name (TEAMID)" (default: the first one in the keychain)
-#   NOTARY_PROFILE        notarytool keychain profile (default: simbar-notary)
+#   NOTARY_PROFILE        notarytool keychain profile (default: motystudio-notary, shared by every Moty Studio app)
 #   SPARKLE_KEY_ACCOUNT   keychain account of the Sparkle EdDSA key (default: simlease)
 #   SPARKLE_ED_KEY_FILE   use this private key file instead of the keychain
 #   TAP_DIR               local checkout of motystudio/homebrew-tap (needed for --publish)
@@ -38,7 +38,7 @@ VERSION=$(tr -d '[:space:]' < VERSION)
 TAG="v$VERSION"
 ZIP_NAME="SimBar-$VERSION.zip"
 DOWNLOAD_PREFIX="https://github.com/$REPO/releases/download/$TAG/"
-NOTARY_PROFILE=${NOTARY_PROFILE:-simbar-notary}
+NOTARY_PROFILE=${NOTARY_PROFILE:-motystudio-notary}
 SPARKLE_KEY_ACCOUNT=${SPARKLE_KEY_ACCOUNT:-simlease}
 PUBLIC_KEY_FILE=packaging/sparkle-public-key.txt
 DIST="$ROOT/dist"

@@ -168,7 +168,7 @@ The app bundles its own copies of `bin/sim-lease` and `CLAUDE.snippet.md`, which
 Debug flags:
 
 - `SimBar --setup DIR` runs the installation check and install against `DIR`, a stand-in for `~/.claude`, then exits.
-- `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data to a PNG and exits (some buttons render as yellow squares, an `ImageRenderer` limitation).
+- `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data to a PNG and exits. Add `--view settings` or `--view onboarding-1` … `onboarding-5` to render another window, `--sim-lease PATH` to use another script, and `--claude-dir DIR` to check a stand-in for `~/.claude`.
 
 Releases are cut with `scripts/release.sh`: it builds the app, signs it with a Developer ID, notarizes it, and publishes the zip that GitHub Releases, Sparkle updates and the Homebrew cask all point to. The script documents its steps and the credentials it expects.
 
