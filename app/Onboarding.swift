@@ -188,13 +188,14 @@ struct RequirementRow: View {
 }
 
 struct StatusIcon: View {
-    enum Kind { case ok, warning, error, neutral }
+    enum Kind { case ok, warning, attention, error, neutral }
     let kind: Kind
 
     var body: some View {
         let (symbol, color): (String, Color) = switch kind {
         case .ok: ("checkmark.circle.fill", .green)
         case .warning: ("arrow.triangle.2.circlepath.circle.fill", .orange)
+        case .attention: ("exclamationmark.circle.fill", .orange)
         case .error: ("xmark.circle.fill", .red)
         case .neutral: ("minus.circle.fill", .secondary)
         }
@@ -208,7 +209,9 @@ struct InstallStep: View {
     /// Error message per item that failed during the last install, nil before any.
     @State private var failures: [SetupItem: String]? = nil
 
-    var allInstalled: Bool { SetupItem.allCases.allSatisfy { store.setupStates[$0] == .ok } }
+    var allInstalled: Bool { SetupItem.allCases.allSatisfy { store.setupStates[$0]?.isInstalled == true } }
+    /// What the Install button does: a customized or malformed rule is only replaced on request.
+    var todo: [SetupItem] { SetupItem.allCases.filter { store.setupStates[$0]?.installsSilently == true } }
 
     var body: some View {
         StepPage(symbol: "square.and.arrow.down", tint: .blue,
@@ -225,7 +228,7 @@ struct InstallStep: View {
                         Spacer()
                         if installing { ProgressView().controlSize(.small) }
                         Button(allInstalled ? L("Installed", "Installé") : L("Install", "Installer")) { install() }
-                            .disabled(installing || allInstalled || store.setupStates.isEmpty)
+                            .disabled(installing || todo.isEmpty)
                     }
                 }
             }
@@ -253,18 +256,32 @@ struct InstallStep: View {
         let state = store.setupStates[item]
         let error = failures?[item]
         return HStack(alignment: .firstTextBaseline, spacing: 10) {
-            StatusIcon(kind: error != nil ? .error : state == .ok ? .ok : state == .outdated ? .warning : .neutral)
+            StatusIcon(kind: error != nil ? .error : state?.isInstalled == true ? .ok
+                       : state == .outdated ? .warning : state == .malformed ? .attention : .neutral)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
                 Text(item.detail).font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if state == .customized || state == .malformed {
+                    HStack(spacing: 6) {
+                        Text(state == .customized
+                             ? L("Customized, so not updated automatically.", "Personnalisée, donc pas mise à jour automatiquement.")
+                             : L("<simulators> has no closing </simulators> tag.", "<simulators> n'a pas de balise de fermeture </simulators>."))
+                            .foregroundStyle(state == .customized ? Color.secondary : .orange)
+                        Button(state == .customized ? L("Replace with the default rule…", "Remplacer par la règle par défaut…")
+                                                    : L("Fix…", "Réparer…")) { replaceRule() }
+                            .buttonStyle(.link).disabled(installing)
+                    }
+                    .font(.footnote)
+                }
                 if let error {
                     Text(error).font(.footnote).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer()
             Text(error != nil ? L("Failed", "Échec")
-                 : state == .ok ? (failures != nil ? L("Done", "Fait") : L("Installed", "Installé"))
+                 : state?.isInstalled == true ? (failures != nil ? L("Done", "Fait") : L("Installed", "Installé"))
                  : state == .outdated ? L("Update available", "Mise à jour dispo.")
+                 : state == .malformed ? L("Needs attention", "À vérifier")
                  : state == nil ? "" : L("Not installed", "Non installé"))
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize()
@@ -273,10 +290,16 @@ struct InstallStep: View {
 
     func install() {
         installing = true
-        let todo = SetupItem.allCases.filter { store.setupStates[$0] != .ok }
         store.install(todo) { result in
             failures = result
             installing = false
+        }
+    }
+
+    /// Asks first; the rule's row then shows the result like any other install.
+    func replaceRule() {
+        store.confirmReplaceRule { error in
+            if let error { failures = (failures ?? [:]).merging([.rule: error]) { $1 } } else { failures?[.rule] = nil }
         }
     }
 }
@@ -305,8 +328,14 @@ struct PreferencesStep: View {
                 } header: {
                     Text(L("Devices started by hand", "Appareils démarrés à la main"))
                 } footer: {
-                    Footnote(L("Simulators you open yourself, outside sim-lease, are shut down once nobody has used them for this long.",
-                               "Les simulateurs que vous ouvrez vous-même, hors sim-lease, sont éteints quand personne ne s'en est servi depuis ce délai."))
+                    // follows the setting, which is off by default (SIM_LEASE_ADOPT_UNMANAGED=0)
+                    if config.adoptUnmanaged.wrappedValue {
+                        Footnote(L("Simulators you open yourself, outside sim-lease, are shut down once nobody has used them for this long.",
+                                   "Les simulateurs que vous ouvrez vous-même, hors sim-lease, sont éteints quand personne ne s'en est servi depuis ce délai."))
+                    } else {
+                        Footnote(L("Simulators you open yourself, outside sim-lease, are left alone. Turn this on to shut them down too once nobody has used them for this long.",
+                                   "Les simulateurs que vous ouvrez vous-même, hors sim-lease, sont laissés tels quels. Activez cette option pour les éteindre aussi quand personne ne s'en est servi depuis ce délai."))
+                    }
                 }
             }
             .formStyle(.grouped)

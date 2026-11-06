@@ -18,6 +18,7 @@ struct DeviceRow: View {
                 .font(.system(size: 18))
                 .foregroundStyle(device.live ? Color.blue : .secondary)
                 .frame(width: 30, height: 40)
+                .accessibilityLabel(L("Show the simulator", "Afficher le simulateur"))
                 .hoverTarget(help: L("Show the simulator", "Afficher le simulateur")) { store.show(device) }
             // name + status: opens the session using it, if any
             VStack(alignment: .leading, spacing: 2) {
@@ -106,25 +107,42 @@ struct DeviceRow: View {
             Image(systemName: name).font(.system(size: 13)).frame(width: 22, height: 22)
                 .foregroundStyle(tint ?? .primary)
         }
-        .buttonStyle(.borderless).help(help)
+        .buttonStyle(.borderless).help(help).accessibilityLabel(help)
     }
 }
 
-/// A clickable part of a row that highlights on its own when hovered.
+/// A clickable part of a row that highlights on its own when hovered. A real button, so
+/// VoiceOver and keyboard navigation can trigger it too.
 struct HoverTarget: ViewModifier {
     let enabled: Bool
     let help: String
     let action: () -> Void
-    @State private var hovering = false
 
-    func body(content: Content) -> some View {
-        content
-            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.primary.opacity(enabled && hovering ? 0.08 : 0)))
-            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .onHover { hovering = $0 }
-            .onTapGesture { if enabled { action() } }
-            .help(help)
+    @ViewBuilder func body(content: Content) -> some View {
+        if enabled {
+            Button(action: action) { content }
+                .buttonStyle(HoverButtonStyle())
+                .help(help)
+        } else {
+            content
+        }
+    }
+}
+
+struct HoverButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { Highlight(configuration: configuration) }
+
+    struct Highlight: View {
+        let configuration: Configuration
+        @State private var hovering = false
+
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
+            configuration.label
+                .background(shape.fill(Color.primary.opacity(configuration.isPressed ? 0.14 : hovering ? 0.08 : 0)))
+                .contentShape(shape)
+                .onHover { hovering = $0 }
+        }
     }
 }
 
@@ -158,7 +176,7 @@ struct Panel: View {
                 Button { store.refresh() } label: {
                     Image(systemName: "arrow.clockwise").frame(width: 22, height: 22)
                 }
-                .buttonStyle(.borderless).help(L("Refresh", "Rafraîchir"))
+                .buttonStyle(.borderless).help(L("Refresh", "Rafraîchir")).accessibilityLabel(L("Refresh", "Rafraîchir"))
                 settingsMenu
             }
             .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
@@ -191,23 +209,30 @@ struct Panel: View {
             Toggle(L("Launch at login", "Lancer à l'ouverture de session"), isOn: Binding(
                 get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
             // only what still needs installing; the whole section disappears once everything is set up
-            let todo = SetupItem.allCases.filter { (store.setupStates[$0] ?? .ok) != .ok }
+            let todo = SetupItem.allCases.filter { !(store.setupStates[$0] ?? .ok).isInstalled }
             if !todo.isEmpty {
                 Divider()
                 Section(L("Setup", "Installation")) {
                     ForEach(todo, id: \.self) { item in
-                        if store.setupStates[item] == .outdated {
+                        switch store.setupStates[item] {
+                        case .outdated:
                             Button { store.install([item]) } label: {
                                 Label(L("Update \(item.title)", "Mettre à jour : \(item.title)"), systemImage: "arrow.triangle.2.circlepath")
                             }
-                        } else {
+                        case .malformed:
+                            // never fixed silently: asks first
+                            Button { store.confirmReplaceRule() } label: {
+                                Label(L("Fix \(item.title)…", "Réparer : \(item.title)…"), systemImage: "exclamationmark.triangle.fill")
+                            }
+                        default:
                             Button { store.install([item]) } label: {
                                 Label(L("Install \(item.title)", "Installer : \(item.title)"), systemImage: "exclamationmark.triangle.fill")
                             }
                         }
                     }
-                    if todo.count > 1 {
-                        Button(L("Install everything", "Tout installer")) { store.install(todo) }
+                    let silent = todo.filter { store.setupStates[$0]?.installsSilently == true }
+                    if silent.count > 1 {
+                        Button(L("Install everything", "Tout installer")) { store.install(silent) }
                     }
                 }
             }
@@ -236,7 +261,8 @@ struct Panel: View {
                     }
                 }
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help(L("Settings", "Réglages"))
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .help(L("Settings", "Réglages")).accessibilityLabel(L("Settings", "Réglages"))
     }
 
     /// Summary of what is idle, with the bulk shutdown actions.
@@ -272,6 +298,7 @@ struct Panel: View {
                 Image(systemName: "ellipsis").frame(width: 20, height: 20)
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help(L("More", "Plus")).accessibilityLabel(L("More", "Plus"))
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.06)))
