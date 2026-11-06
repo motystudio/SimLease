@@ -119,7 +119,7 @@ preflight() {
     local build last
     build=$(tr -d '[:space:]' < BUILD_NUMBER)
     last=$(curl -fsL "https://github.com/$REPO/releases/latest/download/appcast.xml" 2>/dev/null \
-      | sed -n 's/.*<sparkle:version>\([0-9]*\)<\/sparkle:version>.*/\1/p' | sort -n | tail -1)
+      | sed -n 's/.*<sparkle:version>\([0-9]*\)<\/sparkle:version>.*/\1/p' | sort -n | tail -1 || true)   # no release yet
     if [[ -n "$last" ]] && (( build <= last )); then
       add_problem "BUILD_NUMBER is $build but the last release is build $last. Raise BUILD_NUMBER above $last."
     fi
