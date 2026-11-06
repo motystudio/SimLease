@@ -2,9 +2,10 @@
 # sim-lease — share iOS simulators / Android emulators between Claude Code sessions.
 #
 # Each session leases a device instead of booting a fresh one. A lease stays alive
-# while the owning session's transcript keeps changing; idle/released devices are
-# shut down by `sim-lease reap`, which SimBar runs every 5 minutes and every `acquire`
-# runs first. A SessionEnd hook calls `release-session`.
+# while the owning session's transcript (or a subagent's) keeps changing, and for
+# SIM_LEASE_STALE_MIN after each `acquire` (re-running it refreshes the lease);
+# idle/released devices are shut down by `sim-lease reap`, which SimBar runs every
+# 5 minutes and every `acquire` runs first. A SessionEnd hook calls `release-session`.
 #
 #   sim-lease acquire ios|android [--name NAME] [--wait SECS]   -> prints UDID / adb serial
 #   sim-lease release [ID]          release this session's lease(s) (device kept warm for reuse)
@@ -26,6 +27,7 @@
 #   SIM_LEASE_GRACE_MIN=10     released device is kept warm this long, then shut down
 #   SIM_LEASE_ADOPT_UNMANAGED=0  1 = also shut down devices booted outside sim-lease, after
 #   SIM_LEASE_UNMANAGED_GRACE_MIN=30   (0 = leave them alone unless a session leases them)
+#   SIM_LEASE_BOOT_TIMEOUT_SEC=600   (env only) how long `acquire` waits for a simulator to boot
 
 set -u
 SIM_LEASE_VERSION=1.0.0
@@ -77,11 +79,12 @@ STALE_MIN=$SIM_LEASE_STALE_MIN
 GRACE_MIN=$SIM_LEASE_GRACE_MIN
 ADOPT=$SIM_LEASE_ADOPT_UNMANAGED
 UNMANAGED_GRACE_MIN=$SIM_LEASE_UNMANAGED_GRACE_MIN
+BOOT_TIMEOUT=${SIM_LEASE_BOOT_TIMEOUT_SEC:-600}; [[ "$BOOT_TIMEOUT" =~ ^[0-9]+$ ]] || BOOT_TIMEOUT=600
 
 DIR="$HOME/.claude/sim-leases"
 LOCK="$DIR/.lock"
 LOG="$DIR/sim-lease.log"
-for ANDROID_SDK in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Library/Android/sdk" /opt/homebrew/share/android-commandlinetools; do
+for ANDROID_SDK in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Library/Android/sdk" /opt/homebrew/share/android-commandlinetools /usr/local/share/android-commandlinetools; do
   [ -n "$ANDROID_SDK" ] && [ -d "$ANDROID_SDK" ] && break
 done
 ADB="$ANDROID_SDK/platform-tools/adb"; [ -x "$ADB" ] || ADB=$(command -v adb || true)
@@ -96,20 +99,39 @@ log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 die() { echo "sim-lease: $1" >&2; exit "${2:-1}"; }   # message [exit code]
 drop() { local f="${DIR:?}/${1:?}"; rm -f "$f"; }
 need_jq() { [ -n "$JQ" ] || die "jq not found (macOS 15+ ships /usr/bin/jq; otherwise: brew install jq)"; }
-need_simctl() { xcrun -f simctl >/dev/null 2>&1 || die "xcrun simctl not available: install Xcode, open it once, then run: sudo xcode-select -s /Applications/Xcode.app"; }
+# xcrun is never run unless a full Xcode is selected: on a Mac without developer tools it
+# pops the install dialog (SimBar polls every 15 s). No Xcode = no iOS, silently.
+HAS_SIMCTL=""
+has_simctl() {
+  if [ -z "$HAS_SIMCTL" ]; then
+    local d; d=${DEVELOPER_DIR:-$(xcode-select -p 2>/dev/null)}; HAS_SIMCTL=0
+    [ -n "$d" ] && [ -d "$d" ] && { [ -d "$d/Platforms/iPhoneSimulator.platform" ] || xcrun -f simctl >/dev/null 2>&1; } && HAS_SIMCTL=1
+  fi
+  [ "$HAS_SIMCTL" = 1 ]
+}
+need_simctl() { has_simctl || die "xcrun simctl not available: install Xcode, open it once, then run: sudo xcode-select -s /Applications/Xcode.app"; }
 need_adb() { [ -n "$ADB" ] || die "adb not found: install the Android SDK platform-tools, or set ANDROID_HOME"; }
 
+# $LOCK/pid holds the holder's PID. A lock is broken only when that process is gone (boots
+# hold it for minutes), or, without a PID file (killed right after mkdir), after 10 min.
+try_lock() { mkdir "$LOCK" 2>/dev/null || return 1; echo $$ > "$LOCK/pid"; trap unlock EXIT; }
 lock() {
-  local i=0
-  while ! mkdir "$LOCK" 2>/dev/null; do
-    # break a lock left by a killed process (boots can take a few minutes)
-    if [ $(( $(now) - $(stat -f %m "$LOCK" 2>/dev/null || now) )) -gt 600 ]; then rmdir "$LOCK" 2>/dev/null; continue; fi
+  local i=0 pid
+  until try_lock; do
+    pid=$(cat "$LOCK/pid" 2>/dev/null)
+    if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } ||
+       { [ -z "$pid" ] && [ $(( $(now) - $(stat -f %m "$LOCK" 2>/dev/null || now) )) -gt 600 ]; }; then
+      if mv "$LOCK" "$LOCK.$$" 2>/dev/null; then   # rename first so two waiters can't both break it
+        [ "$(cat "$LOCK.$$/pid" 2>/dev/null)" = "$pid" ] || [ -e "$LOCK" ] || mv "$LOCK.$$" "$LOCK"   # raced: give it back
+        rm -f "$LOCK.$$/pid"; rmdir "$LOCK.$$" 2>/dev/null; log "broke stale lock (pid ${pid:-none})"
+      fi
+      continue
+    fi
     i=$((i+1)); [ $i -gt 900 ] && die "lock timeout"
     sleep 1
   done
-  trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 }
-unlock() { rmdir "$LOCK" 2>/dev/null; trap - EXIT; }
+unlock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; }; trap - EXIT; }
 
 # --- lease files: $DIR/<id>, key=value lines -------------------------------
 lget() { grep -m1 "^$2=" "$DIR/$1" 2>/dev/null | cut -d= -f2-; }
@@ -124,29 +146,47 @@ PINS="$DIR/.pinned"
 pin_key() { if [ "$2" = ios ]; then echo "$1"; else echo "${3:-$(lget "$1" name)}"; fi; }   # id platform [name]
 pinned() { [ -f "$PINS" ] && grep -qxF "$(pin_key "$@")" "$PINS"; }
 
-# last activity of a session = mtime of its transcript. Finding the transcript means
-# globbing every project folder, so its path is cached in $DIR/.transcripts (`acquire`
-# primes it, so SimBar also finds transcripts under a CLAUDE_CONFIG_DIR it doesn't know).
+# last activity of a session = newest mtime of its transcript and of its subagents'
+# transcripts (<projects>/<proj>/<sid>/subagents/agent-*.jsonl), 0 if none is found.
+# Finding the transcript means globbing every project folder, so its path is cached in
+# $DIR/.transcripts (`acquire` primes it, so SimBar also finds transcripts under a
+# CLAUDE_CONFIG_DIR it doesn't know).
 TRANSCRIPTS="$DIR/.transcripts"
 session_last_active() {
-  local f
+  local f t
   f=$(awk -v s="$1" '$1==s {print substr($0, length(s)+2); exit}' "$TRANSCRIPTS" 2>/dev/null)
   if [ -z "$f" ] || [ ! -f "$f" ]; then
     f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"/projects/*/"$1".jsonl} 2>/dev/null | head -1)
     [ -n "$f" ] && printf '%s %s\n' "$1" "$f" >> "$TRANSCRIPTS"
   fi
-  if [ -n "$f" ]; then stat -f %m "$f"; else echo 0; fi
+  if [ -n "$f" ]; then t=$(ls -t "$f" "${f%/*/*}"/*/"$1"/subagents/agent-*.jsonl 2>/dev/null | head -1)
+  else t=$(ls -t "$HOME"/.claude/projects/*/"$1"/subagents/agent-*.jsonl ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"/projects/*/"$1"/subagents/agent-*.jsonl} 2>/dev/null | head -1); fi
+  if [ -n "$t" ]; then stat -f %m "$t"; else echo 0; fi
+}
+# last activity of a lease = latest of its session's transcripts, its `since` and the lease
+# file's mtime (`acquire` touches it), so a lease outlives a missing transcript or a long
+# tool call by STALE_MIN after the last acquire
+lease_last_active() {
+  local t a b; t=$(session_last_active "$(lget "$1" session)"); a=$(lget "$1" since)
+  b=$(stat -f %m "$DIR/$1" 2>/dev/null || echo 0); [[ "$a" =~ ^[0-9]+$ ]] || a=0
+  [ "$a" -gt "$t" ] && t=$a; [ "$b" -gt "$t" ] && t=$b; echo "$t"
 }
 lease_live() { # id -> 0 if held by an active session
-  local s; s=$(lget "$1" session)
-  case "$s" in ""|none|unmanaged) return 1;; esac
-  [ $(( $(now) - $(session_last_active "$s") )) -lt $((STALE_MIN*60)) ]
+  case "$(lget "$1" session)" in ""|none|unmanaged) return 1;; esac
+  [ $(( $(now) - $(lease_last_active "$1") )) -lt $((STALE_MIN*60)) ]
+}
+# a lease applies to the device booted under its id only if the device's name still matches:
+# an emulator serial (emulator-5554) is reused by whatever AVD next runs on that port
+lease_matches() { # id current_name
+  local n; [ -f "$DIR/$1" ] || return 1; n=$(lget "$1" name)
+  [ -z "$n" ] || [ -z "$2" ] || [ "$n" = "$2" ]
 }
 
 # --- devices -----------------------------------------------------------------
 # both listings fail (rather than print nothing) when the platform can't be queried,
 # so reap doesn't take "simctl/adb unavailable" for "every device is shut down"
-ios_booted() { # "udid<TAB>name"
+ios_booted() { # "udid<TAB>name"  (nothing when Xcode isn't installed)
+  has_simctl || return 0
   local j; j=$(xcrun simctl list devices booted -j 2>/dev/null) && [ -n "$JQ" ] || return 1
   printf '%s' "$j" | "$JQ" -r '.devices[][] | select(.state=="Booted") | "\(.udid)\t\(.name)"'
 }
@@ -157,6 +197,21 @@ android_booted() { # "serial<TAB>avd"  (emulators only, physical devices are nev
   done
 }
 booted() { if [ "$1" = ios ]; then ios_booted; else android_booted; fi; }
+scan() { # snapshot of the booted devices into LIST_ios / LIST_android; OK_<p>=0 if <p> can't be queried
+  has_simctl   # cached for the subshells below
+  OK_ios=1; LIST_ios=$(ios_booted) || OK_ios=0
+  OK_android=1; LIST_android=$(android_booted) || OK_android=0
+}
+prune() { # (after scan, under the lock) drop leases of devices that are gone or now run another device
+  local id p ok list line
+  for id in $(leases); do
+    p=$(lget "$id" platform); [ "$p" = ios ] || p=android
+    ok="OK_$p"; list="LIST_$p"; [ "${!ok}" = 1 ] || continue
+    line=$(printf '%s\n' "${!list}" | awk -F'\t' -v i="$id" '$1==i {print "+" $2; exit}')
+    if [ -z "$line" ]; then drop "$id"   # already shut down
+    elif ! lease_matches "$id" "${line#+}"; then log "drop stale lease $p $id ($(lget "$id" name), now runs ${line#+})"; drop "$id"; fi
+  done
+}
 shutdown_dev() { # id platform  (keeps the lease if the device didn't actually stop)
   local ok=0
   if [ "$2" = ios ]; then xcrun simctl shutdown "$1" >/dev/null 2>&1 || ok=$?
@@ -166,17 +221,26 @@ shutdown_dev() { # id platform  (keeps the lease if the device didn't actually s
   drop "$1"; log "shutdown $2 $1"
 }
 
-boot_ios() { # [name|udid] -> udid
-  local want="${1:-}" udid
-  udid=$(xcrun simctl list devices available -j | "$JQ" -r --arg w "$want" '
+ios_pick() { # [name|udid] -> udid of the shutdown simulator to boot (newest iOS, Pro first), or nothing
+  xcrun simctl list devices available -j 2>/dev/null | "$JQ" -r --arg w "${1:-}" '
     .devices | to_entries | map(select(.key|test("iOS-")))
     | sort_by(.key|capture("iOS-(?<a>[0-9]+)-(?<b>[0-9]+)")|[(.a|tonumber),(.b|tonumber)]) | reverse
     | [.[].value[] | select(.state=="Shutdown")
        | select(if $w=="" then (.name|test("^iPhone")) else (.name==$w or .udid==$w) end)]
-    | (map(select(.name|test("Pro$"))) + .) | .[0].udid // empty')
+    | (map(select(.name|test("Pro$"))) + .) | .[0].udid // empty'
+}
+boot_ios() { # [name|udid] -> udid
+  local want="${1:-}" udid pid i
+  udid=$(ios_pick "$want")
   [ -n "$udid" ] || die "no shutdown iOS simulator matching '${want:-iPhone}' (add one in Xcode > Window > Devices and Simulators)"
   xcrun simctl boot "$udid" >/dev/null 2>&1 || ios_booted | cut -f1 | grep -qx "$udid" || die "could not boot simulator $udid"
-  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
+  # bootstatus has no timeout (a first boot after an Xcode update can take 10+ min) and we hold the lock
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 & pid=$!
+  for ((i = 0; i < BOOT_TIMEOUT; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; log "boot timeout ios $udid"
+    die "simulator $udid did not finish booting in $((BOOT_TIMEOUT / 60)) min; it may still be booting: run acquire again in a few minutes"
+  fi
   echo "$udid"
 }
 boot_android() { # [avd] -> serial
@@ -202,15 +266,12 @@ boot_android() { # [avd] -> serial
 }
 
 # --- commands ----------------------------------------------------------------
-reap() {
-  local id p s idle_since grace list list_ios list_android ok_ios=1 ok_android=1
-  list_ios=$(ios_booted) || ok_ios=0
-  list_android=$(android_booted) || ok_android=0
+reap() { # (under the lock)
+  local id p s idle_since grace ok list name gone=" "
+  scan; prune
   for id in $(leases); do
-    p=$(lget "$id" platform)
-    if [ "$p" = ios ]; then [ $ok_ios = 1 ] || continue; list=$list_ios
-    else [ $ok_android = 1 ] || continue; list=$list_android; fi
-    echo "$list" | cut -f1 | grep -qx "$id" || { drop "$id"; continue; }   # already shut down
+    p=$(lget "$id" platform); [ "$p" = ios ] || p=android
+    ok="OK_$p"; [ "${!ok}" = 1 ] || continue
     lease_live "$id" && continue
     pinned "$id" "$p" && continue
     s=$(lget "$id" session)
@@ -218,21 +279,25 @@ reap() {
       none)      idle_since=$(lget "$id" released_at); grace=$GRACE_MIN ;;
       unmanaged) [ "$ADOPT" = 1 ] || { drop "$id"; continue; }   # adoption turned off: leave it alone
                  idle_since=$(lget "$id" released_at); grace=$UNMANAGED_GRACE_MIN ;;
-      *)         idle_since=$(( $(session_last_active "$s") + STALE_MIN*60 )); grace=$GRACE_MIN ;;
+      *)         idle_since=$(( $(lease_last_active "$id") + STALE_MIN*60 )); grace=$GRACE_MIN ;;
     esac
-    [ $(( $(now) - ${idle_since:-0} )) -ge $((grace*60)) ] && shutdown_dev "$id" "$p"
+    [ $(( $(now) - ${idle_since:-0} )) -ge $((grace*60)) ] && shutdown_dev "$id" "$p" && gone="$gone $id "
+  done
+  for p in ios android; do   # keep the snapshot current for acquire (an emulator dies asynchronously)
+    list="LIST_$p"; [ "$gone" = " " ] || printf -v "$list" '%s' "$(printf '%s\n' "${!list}" | awk -F'\t' -v g="$gone" 'index(g, " " $1 " ") == 0')"
   done
   [ "$ADOPT" = 1 ] || return 0
   for p in ios android; do
-    booted "$p" | while IFS=$'\t' read -r id name; do
+    list="LIST_$p"
+    while IFS=$'\t' read -r id name; do
       [ -n "$id" ] && [ ! -f "$DIR/$id" ] || continue
       lwrite "$id" "$p" "$name" unmanaged "$(now)"; log "adopt $p $id ($name)"
-    done
+    done <<< "${!list}"
   done
 }
 
 acquire() {
-  local p="${1:-}" want="" wait=0 id name n max deadline
+  local p="${1:-}" want="" wait=0 id name n max deadline list held
   shift || true
   [ "$p" = ios ] || [ "$p" = android ] || die "usage: sim-lease acquire ios|android [--name NAME] [--wait SECS]"
   while [ $# -gt 0 ]; do case "$1" in
@@ -242,28 +307,35 @@ acquire() {
   esac; done
   [ -n "$SID" ] || die "CLAUDE_CODE_SESSION_ID not set; run from a Claude Code session"
   [ "$p" = ios ] && need_simctl
-  session_last_active "$SID" >/dev/null   # caches this session's transcript path
+  # caches this session's transcript path; without one the lease lives only on acquire calls
+  if [ "$(session_last_active "$SID")" = 0 ] && ! grep -qxF "$SID" "$DIR/.warned" 2>/dev/null; then
+    echo "$SID" >> "$DIR/.warned"
+    echo "sim-lease: warning: this session's transcript wasn't found under ~/.claude/projects; run acquire again at least every $STALE_MIN min to keep the lease alive" >&2
+  fi
   max=$MAX_IOS; [ "$p" = android ] && max=$MAX_ANDROID
   deadline=$(( $(now) + wait ))
   while :; do
     lock; reap
-    # 1. this session already holds one
+    # 1. this session already holds one: refresh the lease
     for id in $(leases); do
       [ "$(lget "$id" platform)" = "$p" ] && [ "$(lget "$id" session)" = "$SID" ] || continue
       [ -z "$want" ] || [ "$(lget "$id" name)" = "$want" ] || [ "$id" = "$want" ] || continue
-      echo "$id"; return 0
+      touch "$DIR/$id"; echo "$id"; return 0
     done
-    # 2. a booted device nobody is using
+    # 2. a booted device nobody is using (a named one held by a live session is busy)
+    list="LIST_$p"; held=0
     while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
       [ -z "$want" ] || [ "$name" = "$want" ] || [ "$id" = "$want" ] || continue
-      lease_live "$id" && continue
+      lease_live "$id" && { [ -n "$want" ] && held=1; continue; }
       lwrite "$id" "$p" "$name" "$SID" "" "$HOST_SID"; log "lease $p $id ($name) -> $SID (reused)"
       echo "$id"; return 0
-    done <<< "$(booted "$p")"
-    # 3. boot a new one if under the cap
-    n=$(booted "$p" | grep -c .)
-    if [ "$n" -lt "$max" ]; then
+    done <<< "${!list}"
+    # 3. boot a new one if under the cap, unless the named device is busy (an AVD runs once;
+    #    an iOS name can still match another, shutdown simulator)
+    [ "$held" = 1 ] && [ "$p" = ios ] && [ -n "$(ios_pick "$want")" ] && held=0
+    n=$(printf '%s\n' "${!list}" | grep -c .)
+    if [ "$held" = 0 ] && [ "$n" -lt "$max" ]; then
       if [ "$p" = ios ]; then id=$(boot_ios "$want") || exit 1
       else id=$(boot_android "$want") || exit 1; fi
       name=$(booted "$p" | awk -F'\t' -v u="$id" '$1==u{print $2}')
@@ -272,8 +344,13 @@ acquire() {
     fi
     unlock
     if [ "$(now)" -ge "$deadline" ]; then
-      echo "sim-lease: all $max $p devices are in use by other sessions:" >&2; status >&2
-      echo "Retry with --wait 300, or ask the user to raise SIM_LEASE_MAX_$(echo "$p" | tr a-z A-Z)." >&2
+      if [ "$held" = 1 ]; then
+        echo "sim-lease: $want is in use by another session:" >&2; status >&2
+        echo "Retry with --wait 300, or acquire without --name." >&2
+      else
+        echo "sim-lease: all $max $p devices are in use by other sessions:" >&2; status >&2
+        echo "Retry with --wait 300, or ask the user to raise SIM_LEASE_MAX_$(echo "$p" | tr a-z A-Z)." >&2
+      fi
       exit 3
     fi
     sleep 10
@@ -293,29 +370,35 @@ release() { # [id] [session]  (device stays booted GRACE_MIN so the next session
 }
 
 status() {
-  local p id name s ra info
+  local p id name s ra info list
+  scan
   for p in ios android; do
-    booted "$p" | while IFS=$'\t' read -r id name; do
+    list="LIST_$p"
+    while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
-      s=$(lget "$id" session)
-      if lease_live "$id"; then info="leased by $s (active $(( ($(now) - $(session_last_active "$s"))/60 )) min ago)"
+      s=""; lease_matches "$id" "$name" && s=$(lget "$id" session)   # else: stale lease of another device
+      if [ -n "$s" ] && lease_live "$id"; then info="leased by $s (active $(( ($(now) - $(lease_last_active "$id"))/60 )) min ago)"
       elif [ -z "$s" ]; then info="no lease"
       else ra=$(lget "$id" released_at); info="idle ($s) since $(( ($(now) - ${ra:-$(now)})/60 )) min"; fi
       printf '%-8s %-38s %-26s %s\n' "$p" "$id" "$name" "$info"
-    done
+    done <<< "${!list}"
   done
 }
 
-# one JSON object per booted device, for the menu bar app
+# one JSON object per booted device, for the menu bar app. Also drops leases of devices that
+# are gone or replaced, unless another command holds the lock (never waits for it).
 json() {
-  local p id name s live last ra grace left pin
+  local p id name s live last ra grace left pin host list
+  if try_lock; then scan; prune; unlock; else scan; fi
   for p in ios android; do
-    booted "$p" | while IFS=$'\t' read -r id name; do
+    list="LIST_$p"
+    while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
-      s=$(lget "$id" session); ra=$(lget "$id" released_at); last=0; left=-1
+      s=""; ra=""; host=""; last=0; left=-1
+      lease_matches "$id" "$name" && { s=$(lget "$id" session); ra=$(lget "$id" released_at); host=$(lget "$id" host); }
       if pinned "$id" "$p" "$name"; then pin=true; else pin=false; fi
-      case "$s" in ""|none|unmanaged) ;; *) last=$(session_last_active "$s") ;; esac
-      if lease_live "$id"; then live=true; else
+      case "$s" in ""|none|unmanaged) ;; *) last=$(lease_last_active "$id") ;; esac
+      if [ -n "$s" ] && lease_live "$id"; then live=true; else
         live=false
         case "$s" in
           "")        ;;
@@ -326,16 +409,16 @@ json() {
         [ "$left" -lt -1 ] && left=0
         [ "$pin" = true ] && left=-1
       fi
-      "$JQ" -nc --arg p "$p" --arg id "$id" --arg name "$name" --arg s "$s" --arg host "$(lget "$id" host)" \
+      "$JQ" -nc --arg p "$p" --arg id "$id" --arg name "$name" --arg s "$s" --arg host "$host" \
         --argjson live "$live" --argjson last "$last" --argjson left "$left" --argjson pin "$pin" \
         '{platform:$p, id:$id, name:$name, session:$s, host:$host, live:$live, lastActive:$last, shutdownInMin:$left, pinned:$pin}'
-    done
+    done <<< "${!list}"
   done | "$JQ" -s .
 }
 
 pin_dev() { # on|off id
   local id="${2:?usage: sim-lease pin|unpin ID}" p=android name="" key
-  echo "$id" | grep -qE '^[0-9A-F-]{36}$' && p=ios
+  echo "$id" | grep -qiE '^[0-9a-f-]{36}$' && { p=ios; id=$(echo "$id" | tr a-f A-F); }
   [ "$p" = android ] && name=$(android_booted | awk -F'\t' -v s="$id" '$1==s{print $2}')
   key=$(pin_key "$id" "$p" "${name:-$id}")   # Android: accepts the serial or the AVD name
   lock; touch "$PINS"
@@ -346,8 +429,8 @@ pin_dev() { # on|off id
 
 kill_dev() { # id — shut down now, whoever holds it
   local id="${1:?usage: sim-lease kill ID}" p=android
-  echo "$id" | grep -qE '^[0-9A-F-]{36}$' && p=ios
-  [ "$p" = android ] && need_adb
+  echo "$id" | grep -qiE '^[0-9a-f-]{36}$' && { p=ios; id=$(echo "$id" | tr a-f A-F); }
+  if [ "$p" = ios ]; then need_simctl; else need_adb; fi
   lock; shutdown_dev "$id" "$p" || die "could not shut down $id"; echo "shut down $id"
 }
 
@@ -357,7 +440,7 @@ shutdown_idle() {
   for p in ios android; do
     booted "$p" | while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
-      lease_live "$id" || pinned "$id" "$p" "$name" || shutdown_dev "$id" "$p"
+      { lease_matches "$id" "$name" && lease_live "$id"; } || pinned "$id" "$p" "$name" || shutdown_dev "$id" "$p"
     done
   done
 }
