@@ -14,7 +14,7 @@ SimLease has two parts:
 ## Requirements
 
 - macOS 15 or later (the script uses the system `/usr/bin/jq`)
-- Xcode or its command line tools, for iOS simulators
+- Xcode (the full app, with an iOS simulator runtime), for iOS simulators
 - The Android SDK, optional, for Android emulators
 - [Claude Code](https://claude.com/claude-code)
 
@@ -136,7 +136,7 @@ With Homebrew:
 brew uninstall --zap --cask simlease
 ```
 
-Then remove the `<simulators>` block from `~/.claude/CLAUDE.md` and the `sim-lease release-session` entry from `hooks.SessionEnd` in `~/.claude/settings.json`, if they are still there.
+Then remove `~/.claude/bin/sim-lease`, the `<simulators>` block from `~/.claude/CLAUDE.md` and the `sim-lease release-session` entry from `hooks.SessionEnd` in `~/.claude/settings.json`, if they are still there. Homebrew can't edit those files for you, and the script stays until you remove the hook that calls it.
 
 By hand, remove:
 
@@ -144,7 +144,7 @@ By hand, remove:
 - `~/.claude/bin/sim-lease`
 - `~/.claude/sim-leases/` (leases, pins and log)
 - `~/.claude/sim-lease.conf`
-- the `<simulators>` … `</simulators>` block in `~/.claude/CLAUDE.md`
+- the `<simulators>` … `</simulators>` block in `~/.claude/CLAUDE.md` (and `CLAUDE.md.backup-simbar` if you don't need it)
 - the `sim-lease release-session` entry under `hooks.SessionEnd` in `~/.claude/settings.json` (and `settings.json.backup-simbar` if you don't need it)
 
 ## Limitations

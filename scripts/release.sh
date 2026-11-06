@@ -13,7 +13,8 @@
 #   SPARKLE_ED_KEY_FILE   use this private key file instead of the keychain
 #   TAP_DIR               local checkout of motystudio/homebrew-tap (needed for --publish)
 #
-# The version comes from VERSION. Optional release notes: packaging/release-notes/<version>.md
+# The version comes from VERSION and the build number from BUILD_NUMBER (raise it for every
+# release: Sparkle only offers higher builds). Optional release notes: packaging/release-notes/<version>.md
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -109,11 +110,25 @@ preflight() {
 
   if [[ $PUBLISH == 1 ]]; then
     if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-      add_problem "Tag $TAG already exists. Bump VERSION first."
+      add_problem "Tag $TAG already exists. Bump VERSION (and BUILD_NUMBER) first."
     fi
     if ! gh auth status >/dev/null 2>&1; then
       add_problem "The GitHub CLI is not logged in. Run: gh auth login"
     fi
+    # Sparkle only offers an update whose build number is higher than the installed one
+    local build last
+    build=$(tr -d '[:space:]' < BUILD_NUMBER)
+    last=$(curl -fsL "https://github.com/$REPO/releases/latest/download/appcast.xml" 2>/dev/null \
+      | sed -n 's/.*<sparkle:version>\([0-9]*\)<\/sparkle:version>.*/\1/p' | sort -n | tail -1)
+    if [[ -n "$last" ]] && (( build <= last )); then
+      add_problem "BUILD_NUMBER is $build but the last release is build $last. Raise BUILD_NUMBER above $last."
+    fi
+    # release assets of a private repo can't be downloaded by Sparkle or Homebrew
+    for r in "$REPO" "${REPO%%/*}/homebrew-tap"; do
+      if [[ "$(gh repo view "$r" --json visibility --jq .visibility 2>/dev/null)" != PUBLIC ]]; then
+        add_problem "$r is not public: users could not download the release. Make it public first."
+      fi
+    done
     if [[ -z "${TAP_DIR:-}" ]]; then
       add_problem "TAP_DIR is not set. Clone the tap and point to it:
           git clone https://github.com/motystudio/homebrew-tap ~/Documents/Projects/homebrew-tap

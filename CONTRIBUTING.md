@@ -22,7 +22,7 @@ The app bundles `bin/sim-lease` and `CLAUDE.snippet.md`; rebuild after changing 
 ## Style
 
 - `bin/sim-lease` is bash, kept POSIX-ish and compact: no dependencies beyond what macOS ships (`/usr/bin/jq`, `xcrun`) and the Android SDK tools. Short functions, one-line comments where the why is not obvious.
-- SimBar is a single SwiftUI file, `app/SimBar.swift`.
+- SimBar is SwiftUI, split by area in `app/`: `SimBar.swift` (app entry), `Model.swift`, `Panel.swift`, `Setup.swift`, `Onboarding.swift`, `SettingsView.swift`, `Config.swift`, `Updater.swift`. `build.sh` compiles every `app/*.swift`.
 - Every user-facing string in SimBar is bilingual: `L("English", "Français")`.
 - Code, comments, docs and commit messages are in English.
 - Add a line to `CHANGELOG.md` under `[Unreleased]` for user-visible changes.

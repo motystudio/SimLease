@@ -24,8 +24,12 @@ cask "simlease" do
   uninstall quit: "com.motystudio.simbar"
 
   zap trash: [
+    "~/.claude/CLAUDE.md.backup-simbar",
+    "~/.claude/settings.json.backup-simbar",
     "~/.claude/sim-lease.conf",
     "~/.claude/sim-leases",
+    "~/Library/Caches/com.motystudio.simbar",
+    "~/Library/HTTPStorages/com.motystudio.simbar",
     "~/Library/Preferences/com.motystudio.simbar.plist",
   ]
 

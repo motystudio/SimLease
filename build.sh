@@ -15,7 +15,7 @@ MIN_MACOS=15.0   # the app relies on /usr/bin/jq, which ships with macOS 15+
 BUNDLE_ID=com.motystudio.simbar
 FEED_URL=https://github.com/motystudio/SimLease/releases/latest/download/appcast.xml
 VERSION=$(tr -d '[:space:]' < VERSION)
-BUILD_NUMBER=${BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}
+BUILD_NUMBER=${BUILD_NUMBER:-$(tr -d "[:space:]" < BUILD_NUMBER)}   # Sparkle compares this: it must grow with every release
 IDENTITY=${SIMBAR_SIGN_IDENTITY:--}
 
 if [[ "$IDENTITY" != "-" ]] && ! security find-identity -v -p codesigning | grep -qF "\"$IDENTITY\""; then
