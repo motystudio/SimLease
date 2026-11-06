@@ -15,38 +15,89 @@
 #   sim-lease kill ID               shut down one device now
 #   sim-lease pin|unpin ID          keep a device alive: never shut down automatically
 #   sim-lease json                  booted devices + leases as JSON (menu bar app)
+#   sim-lease config [json]         show the settings (json: effective values, menu bar app)
+#   sim-lease config set KEY VALUE  write KEY=VALUE to the config file (exit 2 if invalid)
+#   sim-lease config reset [KEY]    remove KEY (default: every setting) from the config file
+#   sim-lease version               print the version
 #
-# Config (env or ~/.claude/sim-lease.conf):
-#   SIM_LEASE_MAX_IOS=3 SIM_LEASE_MAX_ANDROID=2   max booted devices per platform
-#   SIM_LEASE_STALE_MIN=20     lease dies when its session is idle this long
+# Config (env overrides ~/.claude/sim-lease.conf, which only holds SIM_LEASE_*=<integer> lines):
+#   SIM_LEASE_MAX_IOS=3 SIM_LEASE_MAX_ANDROID=2   max booted devices per platform (0-10)
+#   SIM_LEASE_STALE_MIN=20     lease dies when its session is idle this long (minutes, 1-1440)
 #   SIM_LEASE_GRACE_MIN=10     released device is kept warm this long, then shut down
-#   SIM_LEASE_ADOPT_UNMANAGED=1  also shut down devices booted outside sim-lease
-#   SIM_LEASE_UNMANAGED_GRACE_MIN=30
+#   SIM_LEASE_ADOPT_UNMANAGED=0  1 = also shut down devices booted outside sim-lease, after
+#   SIM_LEASE_UNMANAGED_GRACE_MIN=30   (0 = leave them alone unless a session leases them)
 
 set -u
+SIM_LEASE_VERSION=1.0.0
+PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"   # GUI apps (SimBar) get a minimal PATH
+
+# --- config: parsed, never sourced -------------------------------------------
 CONF="$HOME/.claude/sim-lease.conf"
-[ -f "$CONF" ] && . "$CONF"
-MAX_IOS=${SIM_LEASE_MAX_IOS:-3}
-MAX_ANDROID=${SIM_LEASE_MAX_ANDROID:-2}
-STALE_MIN=${SIM_LEASE_STALE_MIN:-20}
-GRACE_MIN=${SIM_LEASE_GRACE_MIN:-10}
-ADOPT=${SIM_LEASE_ADOPT_UNMANAGED:-1}
-UNMANAGED_GRACE_MIN=${SIM_LEASE_UNMANAGED_GRACE_MIN:-30}
+CONF_KEYS="SIM_LEASE_MAX_IOS SIM_LEASE_MAX_ANDROID SIM_LEASE_STALE_MIN SIM_LEASE_GRACE_MIN SIM_LEASE_ADOPT_UNMANAGED SIM_LEASE_UNMANAGED_GRACE_MIN"
+conf_default() {
+  case "$1" in
+    SIM_LEASE_MAX_IOS) echo 3;; SIM_LEASE_MAX_ANDROID) echo 2;; SIM_LEASE_STALE_MIN) echo 20;;
+    SIM_LEASE_GRACE_MIN) echo 10;; SIM_LEASE_ADOPT_UNMANAGED) echo 0;; SIM_LEASE_UNMANAGED_GRACE_MIN) echo 30;;
+    *) return 1;;
+  esac
+}
+conf_valid() { # key value -> 0 if allowed, with the normalized value in CV
+  CV=""
+  [[ "$2" =~ ^[0-9]{1,5}$ ]] || return 1
+  local v=$((10#$2))
+  case "$1" in
+    SIM_LEASE_MAX_IOS|SIM_LEASE_MAX_ANDROID) [ "$v" -le 10 ] || return 1;;
+    SIM_LEASE_ADOPT_UNMANAGED) [ "$v" -le 1 ] || return 1;;
+    SIM_LEASE_STALE_MIN|SIM_LEASE_GRACE_MIN|SIM_LEASE_UNMANAGED_GRACE_MIN) [ "$v" -ge 1 ] && [ "$v" -le 1440 ] || return 1;;
+    *) return 1;;
+  esac
+  CV=$v
+}
+conf_load() { # effective value of every key into $KEY, file value into FILE_KEY, origin (env|file|default) into SRC_KEY
+  local k v e
+  for k in $CONF_KEYS; do printf -v "FILE_$k" '%s' ""; done
+  while IFS='=' read -r k v; do   # last valid assignment in the file wins
+    conf_valid "$k" "$v" && printf -v "FILE_$k" '%s' "$CV"
+  done < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?(SIM_LEASE_[A-Z_]+)=([0-9]+)[[:space:]]*(#.*)?$/\2=\3/p' "$CONF" 2>/dev/null)
+  for k in $CONF_KEYS; do
+    v=$(conf_default "$k"); printf -v "SRC_$k" '%s' default
+    e="FILE_$k"; [ -n "${!e}" ] && { v=${!e}; printf -v "SRC_$k" '%s' file; }
+    e=${!k:-}
+    if [ -n "$e" ]; then
+      if conf_valid "$k" "$e"; then v=$CV; printf -v "SRC_$k" '%s' env
+      else echo "sim-lease: ignoring invalid $k=$e from the environment" >&2; fi
+    fi
+    printf -v "$k" '%s' "$v"
+  done
+}
+conf_load
+MAX_IOS=$SIM_LEASE_MAX_IOS
+MAX_ANDROID=$SIM_LEASE_MAX_ANDROID
+STALE_MIN=$SIM_LEASE_STALE_MIN
+GRACE_MIN=$SIM_LEASE_GRACE_MIN
+ADOPT=$SIM_LEASE_ADOPT_UNMANAGED
+UNMANAGED_GRACE_MIN=$SIM_LEASE_UNMANAGED_GRACE_MIN
 
 DIR="$HOME/.claude/sim-leases"
 LOCK="$DIR/.lock"
 LOG="$DIR/sim-lease.log"
-ANDROID_SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+for ANDROID_SDK in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Library/Android/sdk" /opt/homebrew/share/android-commandlinetools; do
+  [ -n "$ANDROID_SDK" ] && [ -d "$ANDROID_SDK" ] && break
+done
 ADB="$ANDROID_SDK/platform-tools/adb"; [ -x "$ADB" ] || ADB=$(command -v adb || true)
 EMULATOR="$ANDROID_SDK/emulator/emulator"; [ -x "$EMULATOR" ] || EMULATOR=$(command -v emulator || true)
+JQ=/usr/bin/jq; [ -x "$JQ" ] || JQ=$(command -v jq || true)
 SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 HOST_SID="${CLAUDE_CODE_HOST_SESSION_ID:-}"   # desktop app session (local_…), used to jump to it
 mkdir -p "$DIR"
 
 now() { date +%s; }
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
-die() { echo "sim-lease: $*" >&2; exit "${2:-1}"; }
+die() { echo "sim-lease: $1" >&2; exit "${2:-1}"; }   # message [exit code]
 drop() { local f="${DIR:?}/${1:?}"; rm -f "$f"; }
+need_jq() { [ -n "$JQ" ] || die "jq not found (macOS 15+ ships /usr/bin/jq; otherwise: brew install jq)"; }
+need_simctl() { xcrun -f simctl >/dev/null 2>&1 || die "xcrun simctl not available: install Xcode, open it once, then run: sudo xcode-select -s /Applications/Xcode.app"; }
+need_adb() { [ -n "$ADB" ] || die "adb not found: install the Android SDK platform-tools, or set ANDROID_HOME"; }
 
 lock() {
   local i=0
@@ -74,13 +125,14 @@ pin_key() { if [ "$2" = ios ]; then echo "$1"; else echo "${3:-$(lget "$1" name)
 pinned() { [ -f "$PINS" ] && grep -qxF "$(pin_key "$@")" "$PINS"; }
 
 # last activity of a session = mtime of its transcript. Finding the transcript means
-# globbing every project folder, so its path is cached in $DIR/.transcripts.
+# globbing every project folder, so its path is cached in $DIR/.transcripts (`acquire`
+# primes it, so SimBar also finds transcripts under a CLAUDE_CONFIG_DIR it doesn't know).
 TRANSCRIPTS="$DIR/.transcripts"
 session_last_active() {
   local f
   f=$(awk -v s="$1" '$1==s {print substr($0, length(s)+2); exit}' "$TRANSCRIPTS" 2>/dev/null)
   if [ -z "$f" ] || [ ! -f "$f" ]; then
-    f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1)
+    f=$(ls "$HOME"/.claude/projects/*/"$1".jsonl ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"/projects/*/"$1".jsonl} 2>/dev/null | head -1)
     [ -n "$f" ] && printf '%s %s\n' "$1" "$f" >> "$TRANSCRIPTS"
   fi
   if [ -n "$f" ]; then stat -f %m "$f"; else echo 0; fi
@@ -92,12 +144,15 @@ lease_live() { # id -> 0 if held by an active session
 }
 
 # --- devices -----------------------------------------------------------------
+# both listings fail (rather than print nothing) when the platform can't be queried,
+# so reap doesn't take "simctl/adb unavailable" for "every device is shut down"
 ios_booted() { # "udid<TAB>name"
-  xcrun simctl list devices booted -j 2>/dev/null | /usr/bin/jq -r '.devices[][] | select(.state=="Booted") | "\(.udid)\t\(.name)"'
+  local j; j=$(xcrun simctl list devices booted -j 2>/dev/null) && [ -n "$JQ" ] || return 1
+  printf '%s' "$j" | "$JQ" -r '.devices[][] | select(.state=="Booted") | "\(.udid)\t\(.name)"'
 }
 android_booted() { # "serial<TAB>avd"  (emulators only, physical devices are never touched)
-  [ -n "$ADB" ] || return 0
-  "$ADB" devices 2>/dev/null | awk '$1 ~ /^emulator-/ && $2=="device" {print $1}' | while read -r s; do
+  local d; [ -n "$ADB" ] && d=$("$ADB" devices 2>/dev/null) || return 1
+  echo "$d" | awk '$1 ~ /^emulator-/ && $2=="device" {print $1}' | while read -r s; do
     printf '%s\t%s\n' "$s" "$("$ADB" -s "$s" emu avd name 2>/dev/null | head -1 | tr -d '\r')"
   done
 }
@@ -105,27 +160,29 @@ booted() { if [ "$1" = ios ]; then ios_booted; else android_booted; fi; }
 shutdown_dev() { # id platform  (keeps the lease if the device didn't actually stop)
   local ok=0
   if [ "$2" = ios ]; then xcrun simctl shutdown "$1" >/dev/null 2>&1 || ok=$?
-  else "$ADB" -s "$1" emu kill >/dev/null 2>&1 || ok=$?; fi
+  elif [ -n "$ADB" ]; then "$ADB" -s "$1" emu kill >/dev/null 2>&1 || ok=$?
+  else ok=127; fi
   if [ "$ok" -ne 0 ]; then log "shutdown FAILED $2 $1 (exit $ok)"; return 1; fi
   drop "$1"; log "shutdown $2 $1"
 }
 
 boot_ios() { # [name|udid] -> udid
   local want="${1:-}" udid
-  udid=$(xcrun simctl list devices available -j | /usr/bin/jq -r --arg w "$want" '
+  udid=$(xcrun simctl list devices available -j | "$JQ" -r --arg w "$want" '
     .devices | to_entries | map(select(.key|test("iOS-")))
     | sort_by(.key|capture("iOS-(?<a>[0-9]+)-(?<b>[0-9]+)")|[(.a|tonumber),(.b|tonumber)]) | reverse
     | [.[].value[] | select(.state=="Shutdown")
        | select(if $w=="" then (.name|test("^iPhone")) else (.name==$w or .udid==$w) end)]
     | (map(select(.name|test("Pro$"))) + .) | .[0].udid // empty')
-  [ -n "$udid" ] || die "no shutdown iOS simulator matching '${want:-iPhone}'"
-  xcrun simctl boot "$udid" >/dev/null 2>&1
+  [ -n "$udid" ] || die "no shutdown iOS simulator matching '${want:-iPhone}' (add one in Xcode > Window > Devices and Simulators)"
+  xcrun simctl boot "$udid" >/dev/null 2>&1 || ios_booted | cut -f1 | grep -qx "$udid" || die "could not boot simulator $udid"
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
   echo "$udid"
 }
 boot_android() { # [avd] -> serial
   local want="${1:-}" running avd="" a before s i
-  [ -n "$EMULATOR" ] || die "android emulator binary not found"
+  [ -n "$EMULATOR" ] || die "Android emulator not found: install it with the Android SDK, or set ANDROID_HOME"
+  need_adb
   running=$(android_booted | cut -f2)
   for a in $("$EMULATOR" -list-avds 2>/dev/null | grep -v '^INFO'); do
     echo "$running" | grep -qx "$a" && continue
@@ -146,16 +203,21 @@ boot_android() { # [avd] -> serial
 
 # --- commands ----------------------------------------------------------------
 reap() {
-  local id p s idle_since grace
+  local id p s idle_since grace list list_ios list_android ok_ios=1 ok_android=1
+  list_ios=$(ios_booted) || ok_ios=0
+  list_android=$(android_booted) || ok_android=0
   for id in $(leases); do
     p=$(lget "$id" platform)
-    booted "$p" | cut -f1 | grep -qx "$id" || { drop "$id"; continue; }   # already shut down
+    if [ "$p" = ios ]; then [ $ok_ios = 1 ] || continue; list=$list_ios
+    else [ $ok_android = 1 ] || continue; list=$list_android; fi
+    echo "$list" | cut -f1 | grep -qx "$id" || { drop "$id"; continue; }   # already shut down
     lease_live "$id" && continue
     pinned "$id" "$p" && continue
     s=$(lget "$id" session)
     case "$s" in
       none)      idle_since=$(lget "$id" released_at); grace=$GRACE_MIN ;;
-      unmanaged) idle_since=$(lget "$id" released_at); grace=$UNMANAGED_GRACE_MIN ;;
+      unmanaged) [ "$ADOPT" = 1 ] || { drop "$id"; continue; }   # adoption turned off: leave it alone
+                 idle_since=$(lget "$id" released_at); grace=$UNMANAGED_GRACE_MIN ;;
       *)         idle_since=$(( $(session_last_active "$s") + STALE_MIN*60 )); grace=$GRACE_MIN ;;
     esac
     [ $(( $(now) - ${idle_since:-0} )) -ge $((grace*60)) ] && shutdown_dev "$id" "$p"
@@ -173,8 +235,14 @@ acquire() {
   local p="${1:-}" want="" wait=0 id name n max deadline
   shift || true
   [ "$p" = ios ] || [ "$p" = android ] || die "usage: sim-lease acquire ios|android [--name NAME] [--wait SECS]"
-  while [ $# -gt 0 ]; do case "$1" in --name) want="$2"; shift 2;; --wait) wait="$2"; shift 2;; *) die "unknown arg $1";; esac; done
+  while [ $# -gt 0 ]; do case "$1" in
+    --name) [ -n "${2:-}" ] || die "--name needs a value"; want="$2"; shift 2;;
+    --wait) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--wait needs a number of seconds"; wait="$2"; shift 2;;
+    *) die "unknown arg $1";;
+  esac; done
   [ -n "$SID" ] || die "CLAUDE_CODE_SESSION_ID not set; run from a Claude Code session"
+  [ "$p" = ios ] && need_simctl
+  session_last_active "$SID" >/dev/null   # caches this session's transcript path
   max=$MAX_IOS; [ "$p" = android ] && max=$MAX_ANDROID
   deadline=$(( $(now) + wait ))
   while :; do
@@ -225,7 +293,7 @@ release() { # [id] [session]  (device stays booted GRACE_MIN so the next session
 }
 
 status() {
-  local p id name s ra
+  local p id name s ra info
   for p in ios android; do
     booted "$p" | while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
@@ -258,11 +326,11 @@ json() {
         [ "$left" -lt -1 ] && left=0
         [ "$pin" = true ] && left=-1
       fi
-      /usr/bin/jq -nc --arg p "$p" --arg id "$id" --arg name "$name" --arg s "$s" --arg host "$(lget "$id" host)" \
+      "$JQ" -nc --arg p "$p" --arg id "$id" --arg name "$name" --arg s "$s" --arg host "$(lget "$id" host)" \
         --argjson live "$live" --argjson last "$last" --argjson left "$left" --argjson pin "$pin" \
         '{platform:$p, id:$id, name:$name, session:$s, host:$host, live:$live, lastActive:$last, shutdownInMin:$left, pinned:$pin}'
     done
-  done | /usr/bin/jq -s .
+  done | "$JQ" -s .
 }
 
 pin_dev() { # on|off id
@@ -279,6 +347,7 @@ pin_dev() { # on|off id
 kill_dev() { # id — shut down now, whoever holds it
   local id="${1:?usage: sim-lease kill ID}" p=android
   echo "$id" | grep -qE '^[0-9A-F-]{36}$' && p=ios
+  [ "$p" = android ] && need_adb
   lock; shutdown_dev "$id" "$p" || die "could not shut down $id"; echo "shut down $id"
 }
 
@@ -293,12 +362,71 @@ shutdown_idle() {
   done
 }
 
+conf_write() { # key [value]  rewrite $CONF atomically; no value = remove the key (key "" = every SIM_LEASE_ key)
+  local k="$1" v="${2:-}" target="$CONF" src tmp
+  [ -L "$CONF" ] && target=$(readlink -f "$CONF")   # a symlinked conf (dotfiles) stays a symlink
+  src=$target; [ -f "$src" ] || { [ -n "$v" ] || return 0; src=/dev/null; }
+  tmp=$(mktemp "$target.XXXXXX") || die "cannot write $target"
+  # the first assignment of the key is replaced in place (keeping a trailing comment), later
+  # ones are dropped; comments and every other line are kept as they are
+  awk -v k="$k" -v v="$v" '
+    BEGIN { re = "^[[:space:]]*(export[[:space:]]+)?" (k == "" ? "SIM_LEASE_[A-Za-z0-9_]*" : k) "=" }
+    $0 ~ re {
+      if (v != "" && !done) {
+        rest = ""
+        if ($0 ~ /^[^=]*=[0-9]+[[:space:]]+#/) { rest = substr($0, index($0, "=") + 1); sub(/^[0-9]+/, "", rest) }
+        print substr($0, 1, index($0, "=") - 1) "=" v rest; done = 1
+      }
+      next
+    }
+    { print }
+    END { if (v != "" && !done) print k "=" v }
+  ' "$src" > "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; die "cannot write $target"; }
+}
+
+config() {
+  local k s f src
+  case "${1:-}" in
+    "")
+      echo "Config file: $CONF$([ -f "$CONF" ] || echo ' (not created yet)')"
+      for k in $CONF_KEYS; do
+        s="SRC_$k"; f="FILE_$k"
+        case "${!s}" in
+          file) src="config file";;
+          env)  src="environment$([ -z "${!f}" ] || echo ", overrides config file value ${!f}")";;
+          *)    src="default";;
+        esac
+        printf '%-30s %-5s %s\n' "$k" "${!k}" "$src"
+      done ;;
+    json)
+      printf '{"SIM_LEASE_MAX_IOS":%s,"SIM_LEASE_MAX_ANDROID":%s,"SIM_LEASE_STALE_MIN":%s,"SIM_LEASE_GRACE_MIN":%s,"SIM_LEASE_ADOPT_UNMANAGED":%s,"SIM_LEASE_UNMANAGED_GRACE_MIN":%s}\n' \
+        "$SIM_LEASE_MAX_IOS" "$SIM_LEASE_MAX_ANDROID" "$SIM_LEASE_STALE_MIN" "$SIM_LEASE_GRACE_MIN" "$SIM_LEASE_ADOPT_UNMANAGED" "$SIM_LEASE_UNMANAGED_GRACE_MIN" ;;
+    set)
+      [ $# -eq 3 ] || die "usage: sim-lease config set KEY VALUE" 2
+      conf_default "$2" >/dev/null || die "unknown key '$2' (one of: $CONF_KEYS)" 2
+      conf_valid "$2" "$3" || case "$2" in
+        *_MAX_*)   die "$2 must be an integer from 0 to 10" 2;;
+        *_ADOPT_*) die "$2 must be 0 or 1" 2;;
+        *)         die "$2 must be an integer from 1 to 1440 (minutes)" 2;;
+      esac
+      lock; conf_write "$2" "$CV"; log "config $2=$CV"; echo "$2=$CV" ;;
+    reset)
+      [ $# -le 2 ] || die "usage: sim-lease config reset [KEY]" 2
+      [ -z "${2:-}" ] || conf_default "$2" >/dev/null || die "unknown key '$2' (one of: $CONF_KEYS)" 2
+      lock; conf_write "${2:-}"; log "config reset ${2:-all}" ;;
+    *) die "usage: sim-lease config [json | set KEY VALUE | reset [KEY]]" 2 ;;
+  esac
+}
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
 cmd="${1:-status}"; shift || true
+case "$cmd" in acquire|reap|status|json|shutdown-idle) need_jq ;; esac
 case "$cmd" in
   acquire) acquire "$@" ;;
   release) release "${1:-}" ;;
   release-session)
-    s="${1:-}"; [ -n "$s" ] || s=$(/usr/bin/jq -r '.session_id // empty' 2>/dev/null)
+    s="${1:-}"; [ -n "$s" ] || [ -z "$JQ" ] || s=$("$JQ" -r '.session_id // empty' 2>/dev/null)
     [ -n "$s" ] && release "" "$s" >/dev/null; exit 0 ;;
   reap) lock; reap ;;
   status) status ;;
@@ -307,5 +435,8 @@ case "$cmd" in
   pin) pin_dev on "${1:-}" ;;
   unpin) pin_dev off "${1:-}" ;;
   shutdown-idle) shutdown_idle ;;
-  *) sed -n '2,25p' "$0"; exit 1 ;;
+  config) config "$@" ;;
+  version|--version|-v) echo "$SIM_LEASE_VERSION" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
 esac
