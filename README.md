@@ -23,10 +23,11 @@ SimLease has two parts:
 **Homebrew** (recommended):
 
 ```bash
+brew trust motystudio/tap
 brew install --cask motystudio/tap/simlease
 ```
 
-This installs `SimBar.app` (signed and notarized) and links `sim-lease` into the Homebrew `bin` directory.
+Recent Homebrew versions only load casks from third-party taps you trust, hence the first line. This installs `SimBar.app` (signed and notarized) and links `sim-lease` into the Homebrew `bin` directory.
 
 **Download**: get the zip from [GitHub Releases](https://github.com/motystudio/SimLease/releases), unzip it and move `SimBar.app` to `/Applications`.
 
