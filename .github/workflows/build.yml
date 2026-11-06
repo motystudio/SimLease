@@ -9,8 +9,6 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # CFBundleVersion is the commit count
 
       - name: Cache Sparkle
         uses: actions/cache@v4
@@ -20,10 +18,13 @@ jobs:
 
       - name: Lint shell scripts
         run: |
-          for f in bin/sim-lease build.sh scripts/*.sh; do bash -n "$f"; done
+          for f in bin/sim-lease build.sh scripts/*.sh tests/*.sh; do bash -n "$f"; done
           if command -v shellcheck >/dev/null; then
             shellcheck -S warning bin/sim-lease build.sh scripts/*.sh
           fi
+
+      - name: sim-lease tests (stubbed simctl/adb, no real devices)
+        run: tests/run.sh
 
       - name: Check cask syntax
         run: ruby -c packaging/homebrew/simlease.rb
