@@ -36,6 +36,8 @@ final class SimLeaseConfig: ObservableObject {
 
     @Published private(set) var values: [Key: Int] = [:]
     @Published private(set) var status: Status = .loading
+    /// The limits sim-lease suggests for this Mac's memory, nil with a script that predates them.
+    @Published private(set) var suggested: (ios: Int, android: Int)?
     /// The last write the script refused, shown under the settings.
     @Published var lastError: String?
 
@@ -49,11 +51,12 @@ final class SimLeaseConfig: ObservableObject {
         loads += 1
         let generation = loads
         commandQueue.async {
-            let (status, values) = SimLeaseConfig.read()
+            let (status, values, suggested) = SimLeaseConfig.read()
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard generation == self.loads else { return }   // a newer read is on its way
                     self.status = status
+                    self.suggested = suggested
                     // keep what the user is typing until its write has gone through
                     var merged = values
                     for key in self.pendingWrites.keys { merged[key] = self.values[key] }
@@ -64,19 +67,23 @@ final class SimLeaseConfig: ObservableObject {
     }
 
     /// Blocking: runs on the command queue.
-    nonisolated private static func read() -> (Status, [Key: Int]) {
-        guard FileManager.default.fileExists(atPath: simLease) else { return (.noScript, [:]) }
+    nonisolated private static func read() -> (Status, [Key: Int], (ios: Int, android: Int)?) {
+        guard FileManager.default.fileExists(atPath: simLease) else { return (.noScript, [:], nil) }
         let r = runScript(["config", "json"])
         // an older script prints its usage and exits 1 on an unknown command
         guard r.ok, let json = try? JSONSerialization.jsonObject(with: r.output) as? [String: Any] else {
-            return (.outdatedScript, [:])
+            return (.outdatedScript, [:], nil)
         }
         var values: [Key: Int] = [:]
         for key in Key.allCases {
             if let n = json[key.rawValue] as? NSNumber { values[key] = n.intValue }
             else if let s = json[key.rawValue] as? String, let n = Int(s) { values[key] = n }
         }
-        return (values.isEmpty ? .outdatedScript : .ready, values)
+        var suggested: (ios: Int, android: Int)?
+        if let s = json["suggested"] as? [String: Any], let ios = s["ios"] as? Int, let android = s["android"] as? Int {
+            suggested = (ios, android)
+        }
+        return (values.isEmpty ? .outdatedScript : .ready, values, suggested)
     }
 
     func value(_ key: Key) -> Int? { values[key] }

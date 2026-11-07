@@ -65,6 +65,10 @@ preflight() {
     add_problem "The working tree has uncommitted changes. Commit or stash them, so the release matches a commit."
   fi
 
+  if [[ "$(bin/sim-lease version)" != "$VERSION" ]]; then
+    add_problem "bin/sim-lease says version $(bin/sim-lease version) but VERSION is $VERSION. Update SIM_LEASE_VERSION in the script."
+  fi
+
   if [[ -z "$SIMBAR_SIGN_IDENTITY" ]]; then
     add_problem "No \"Developer ID Application\" signing certificate in your keychain.
      Create one (needs a paid Apple Developer Program membership, as Account Holder):

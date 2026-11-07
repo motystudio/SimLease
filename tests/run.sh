@@ -10,6 +10,10 @@ D=$H/.claude/sim-leases LOCK=$H/.claude/sim-leases/.lock
 mkdir -p "$T/bin" "$T/sdk/platform-tools" "$T/sdk/emulator" "$S/Xcode/Contents/Developer/Platforms/iPhoneSimulator.platform"
 U1=11111111-1111-1111-1111-111111111111 U2=22222222-2222-2222-2222-222222222222
 
+cat > "$T/bin/sysctl" <<'EOF'
+#!/bin/bash
+[ "$2" = hw.memsize ] && [ ! -f "$SL_STATE/nomem" ] && echo $(( $(cat "$SL_STATE/memgb" 2>/dev/null || echo 64) * 1073741824 ))
+EOF
 cat > "$T/bin/xcode-select" <<'EOF'
 #!/bin/bash
 [ -f "$SL_STATE/noxcode" ] && exit 2; echo "$SL_STATE/Xcode/Contents/Developer"
@@ -21,11 +25,12 @@ S=$SL_STATE; echo "xcrun $*" >> "$S/calls"
 [ "$1" = simctl ] && shift
 set_state() { awk -F'\t' -v OFS='\t' -v u="$1" -v st="$2" '$1==u{$3=st}1' "$S/ios" > "$S/ios.t"; mv "$S/ios.t" "$S/ios"; }
 case "$1 $2" in
-  "list devices") while [ -f "$S/hanglist" ]; do sleep 0.2; done; /usr/bin/jq -Rn --arg b "$3" '[inputs | split("\t") | {udid:.[0], name:.[1], state:.[2], isAvailable:true}]
+  "list devices") while [ -f "$S/hanglist" ]; do sleep 0.2; done; /usr/bin/jq -Rn --arg b "$3" '[inputs | split("\t") | {udid:.[0], name:.[1], state:.[2], isAvailable:true, deviceTypeIdentifier:"com.example.type"}]
       | (if $b == "booted" then map(select(.state == "Booted")) else . end) | {devices: {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": .}}' < "$S/ios" ;;
   "boot "*) set_state "$2" Booted ;;
   "bootstatus "*) while [ -f "$S/hang" ]; do sleep 0.2; done ;;
   "shutdown "*) set_state "$2" Shutdown ;;
+  "create "*) [ -f "$S/nocreate" ] && { echo "no such runtime" >&2; exit 1; }; u=$(uuidgen); printf '%s\t%s\tShutdown\n' "$u" "$2" >> "$S/ios"; echo "$u" ;;
 esac
 EOF
 cat > "$T/sdk/platform-tools/adb" <<'EOF'
@@ -57,7 +62,7 @@ run_to() { # secs cmd... -> runs sl in the background, 124 if still running afte
   wait $p
 }
 reset() { # ios lines "udid name state", android lines "serial avd"
-  rm -rf "$D" "$H/.claude/projects" "$S/hang" "$S/hanglist" "$S/noxcode" "$S/race"; mkdir -p "$D" "$H/.claude/projects/p"; X=""; : > "$S/calls"
+  rm -rf "$D" "$H/.claude/projects" "$S/hang" "$S/hanglist" "$S/noxcode" "$S/race" "$S/nocreate" "$S/memgb" "$S/nomem"; mkdir -p "$D" "$H/.claude/projects/p"; X=""; : > "$S/calls"
   printf '%s\n' "$U1	iPhone 17 Pro	Booted" "$U2	iPhone 17	Shutdown" > "$S/ios"; : > "$S/android"; printf 'Pixel_A\nPixel_B\n' > "$S/avds"
 }
 ago() { local m=$1; shift; touch -t "$(date -r $(( $(date +%s) - m * 60 )) +%Y%m%d%H%M.%S)" "$@"; }   # minutes file...
@@ -71,6 +76,8 @@ pass=0 fail=0
 check() { if eval "$2"; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: $1"; fi; }
 
 echo "== syntax"; check "bash -n" "bash -n '$SCRIPT'"
+
+check "the script's version matches VERSION" '[ "$(sl version)" = "$(tr -d "[:space:]" < VERSION)" ]'
 
 echo "== 1. activity: transcript, subagents, lease since/mtime, acquire refresh"
 reset; lease $U1 ios "iPhone 17 Pro" other 0
@@ -115,7 +122,20 @@ check "json keys unchanged" '[ "$(jf ".[0] | keys | join(\",\")")" = "host,id,la
 echo "== 3. acquire --name of a device held by another live session"
 reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0
 run_to 5 acquire ios --name "iPhone 17 Pro"; rc=$?
-check "iOS: exit 3, nothing booted" '[ $rc = 3 ] && grep -q "is in use" "$T/err" && ! grep -q "simctl boot" "$S/calls"'
+check "iOS: a free slot makes another simulator with that name, and says it is empty" 'grep -q "EMPTY" "$T/err" && [ $rc = 0 ] && [ "$(cat "$T/out")" != $U1 ] && grep -q "simctl create iPhone 17 Pro com.example.type com.apple.CoreSimulator.SimRuntime.iOS-26-0" "$S/calls" && grep -q "simctl boot $(cat "$T/out")" "$S/calls" && grep -q "session=$ME" "$D/$(cat "$T/out")"'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+run_to 5 acquire ios --name "iPhone 17 Pro"; rc=$?
+check "iOS: no slot: exit 3, nothing created" '[ $rc = 3 ] && grep -q "is in use" "$T/err" && ! grep -q "simctl create" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0; U3=33333333-3333-3333-3333-333333333333; printf '%s\tiPhone 16\tBooted\n' $U3 >> "$S/ios"; lease $U3 ios "iPhone 16" none 5 $(( $(date +%s) - 300 )); X=SIM_LEASE_MAX_IOS=2
+run_to 5 acquire ios --name "iPhone 17 Pro"; rc=$?
+check "iOS: a device kept warm makes room for the copy" '[ $rc = 0 ] && grep -q "simctl shutdown $U3" "$S/calls" && grep -q "simctl create" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0; touch "$S/nocreate"
+run_to 5 acquire ios --name "iPhone 17 Pro"; rc=$?
+check "iOS: a failed create is exit 3, says why, the name stays busy" '[ $rc = 3 ] && grep -q "could not create" "$T/err" && grep -q "is in use" "$T/err" && ! ls "$D"/.create.err >/dev/null 2>&1'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0
+run_to 5 acquire ios --name $U1; rc=$?
+check "iOS: a busy UDID isn't copied" '[ $rc = 3 ] && ! grep -q "simctl create" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0
 printf '%s\n' "$U2	iPhone 17 Pro	Shutdown" >> "$S/ios"; sed -i '' "/^$U2	iPhone 17	/d" "$S/ios"
 out=$(sl acquire ios --name "iPhone 17 Pro" 2>/dev/null)
 check "iOS: boots another shutdown simulator with that name" '[ "$out" = $U2 ] && grep -q "simctl boot $U2" "$S/calls"'
@@ -221,5 +241,20 @@ out=$(sl acquire ios 2>/dev/null)
 check "an idle iPad is skipped, an iPhone is booted" '[ "$out" = $U2 ]'
 out=$(sl acquire ios --name "iPad Pro 13-inch" 2>/dev/null)
 check "--name still gets the iPad" '[ "$out" = $U1 ]'
+
+echo "== 9. default caps follow the Mac's memory"
+caps() { sl config json | /usr/bin/jq -r '"\(.SIM_LEASE_MAX_IOS) \(.SIM_LEASE_MAX_ANDROID)"'; }
+reset; echo 8 > "$S/memgb"; check "8 GB: 2 iOS, 1 Android" '[ "$(caps)" = "2 1" ]'
+echo 16 > "$S/memgb"; check "16 GB: 2 iOS, 1 Android" '[ "$(caps)" = "2 1" ]'
+echo 36 > "$S/memgb"; check "36 GB: 2 iOS, 1 Android" '[ "$(caps)" = "2 1" ]'
+echo 48 > "$S/memgb"; check "48 GB: 3 iOS, 1 Android" '[ "$(caps)" = "3 1" ]'
+echo 64 > "$S/memgb"; check "64 GB: 5 iOS, 2 Android" '[ "$(caps)" = "5 2" ]'
+echo 128 > "$S/memgb"; check "128 GB: 10 iOS (the maximum), 4 Android" '[ "$(caps)" = "10 4" ]'
+touch "$S/nomem"; check "unknown memory: the minimum" '[ "$(caps)" = "2 1" ]'; rm "$S/nomem"
+echo 64 > "$S/memgb"; check "suggested values are reported" '[ "$(sl config json | /usr/bin/jq -c .suggested)" = "{\"ios\":5,\"android\":2}" ]'
+sl config set SIM_LEASE_MAX_IOS 3 > /dev/null
+check "a value the user set wins, the suggestion stays" '[ "$(caps)" = "3 2" ] && [ "$(sl config json | /usr/bin/jq .suggested.ios)" = 5 ]'
+sl config reset SIM_LEASE_MAX_IOS; check "reset goes back to the suggestion" '[ "$(caps)" = "5 2" ]'
+rm -f "$H/.claude/sim-lease.conf"
 
 echo; echo "$pass passed, $fail failed"; [ "$fail" = 0 ]

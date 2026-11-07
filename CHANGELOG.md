@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-07
+
+### Changed
+
+- The default device limits now follow the Mac's memory instead of a fixed 3 iOS and 2 Android: 2 and 1 up to 36 GB, 5 and 2 with 64 GB, 10 and 4 with 128 GB. The setup assistant and Settings show the suggestion, and a value you set yourself always wins.
+
+### Added
+
+- `acquire --name` makes another simulator with that name when all of them are taken and a slot is free or can be freed. It starts empty, `acquire` says so, and it stays available for later sessions.
+- Installing from the gear menu opens a window that shows each step with a check mark once it is done, and the error of a step that failed.
+
+### Fixed
+
+- Opening Settings no longer crashes SimBar.
+- `sim-lease version` reported 1.0.0 in the 1.1.0 release. The tests and the release script now check that it matches `VERSION`.
+
 ## [1.1.0] - 2026-11-07
 
 ### Changed
@@ -41,6 +57,7 @@ Initial public release.
 - Automatic updates with Sparkle.
 - Homebrew cask (`brew install --cask motystudio/tap/simlease`), signed and notarized universal build (Apple silicon and Intel).
 
-[Unreleased]: https://github.com/motystudio/SimLease/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/motystudio/SimLease/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/motystudio/SimLease/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/motystudio/SimLease/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/motystudio/SimLease/releases/tag/v1.0.0

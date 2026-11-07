@@ -312,8 +312,8 @@ struct PreferencesStep: View {
     var body: some View {
         StepPage(symbol: "gearshape.fill", tint: .gray,
                  title: L("Preferences", "Préférences"),
-                 subtitle: L("You can change these, and the device limits, at any time in Settings.",
-                             "Vous pourrez les modifier, ainsi que les limites d'appareils, à tout moment dans les Réglages.")) {
+                 subtitle: L("You can change these at any time in Settings.",
+                             "Vous pourrez les modifier à tout moment dans les Réglages.")) {
             Form {
                 Section {
                     Toggle(L("Launch SimBar at login", "Lancer SimBar à l'ouverture de session"), isOn: Binding(
@@ -323,6 +323,7 @@ struct PreferencesStep: View {
                             get: { updater.automaticallyChecks }, set: { updater.automaticallyChecks = $0 }))
                     }
                 }
+                if config.status == .ready { DeviceLimits() }
                 Section {
                     if config.status == .ready { UnmanagedRows() } else { ConfigUnavailable() }
                 } header: {
@@ -340,7 +341,7 @@ struct PreferencesStep: View {
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
-            .scrollDisabled(true)
+            // more than fits with the limits: this step scrolls
         }
         .onAppear {
             config.load()

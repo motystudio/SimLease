@@ -33,6 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SimLeaseConfig.shared.load()   // ready by the time Settings opens
             if let path = argument("--snapshot") {
                 Snapshot.render(argument("--view") ?? "panel", to: path)
+            } else if argument("--open") == "settings" {   // debug: reproduce window issues on a real window
+                Windows.shared.showSettings()
+            } else if argument("--open") == "install-progress", argument("--claude-dir") != nil {
+                Store.shared.installShowingProgress(SetupItem.allCases)
             } else if !UserDefaults.standard.bool(forKey: Defaults.onboardingDone) {
                 Windows.shared.showOnboarding()
             }
@@ -55,6 +59,8 @@ final class Windows: NSObject, NSWindowDelegate {
     private var panel: NSWindow?
     private var settings: NSWindow?
     private var onboarding: NSWindow?
+    private var installProgress: NSWindow?
+    private var shownRun: InstallRun?
 
     func showPanel() {
         show(&panel) {
@@ -68,7 +74,9 @@ final class Windows: NSObject, NSWindowDelegate {
     func showSettings() {
         show(&settings) {
             let host = NSHostingController(rootView: SettingsView())
-            host.sizingOptions = .preferredContentSize   // grows when sim-lease's settings load
+            // grows when sim-lease's settings load (.preferredContentSize crashes: the window's size
+            // and the Form's safe area invalidate each other until AppKit raises an exception)
+            host.sizingOptions = .intrinsicContentSize
             let w = NSWindow(contentViewController: host)
             w.title = L("SimBar Settings", "Réglages de SimBar")
             w.styleMask = [.titled, .closable, .miniaturizable]
@@ -90,6 +98,21 @@ final class Windows: NSObject, NSWindowDelegate {
     }
 
     func closeOnboarding() { onboarding?.close() }
+
+    func showInstallProgress(_ run: InstallRun) {
+        if shownRun !== run {   // a new install starts from a fresh window
+            installProgress?.close()
+            installProgress = nil
+            shownRun = run
+        }
+        show(&installProgress) {
+            let view = InstallProgressView(run: run) { [weak self] in self?.installProgress?.close() }
+            let w = NSWindow(contentViewController: NSHostingController(rootView: view))
+            w.title = "SimBar"
+            w.styleMask = [.titled, .closable]
+            return w
+        }
+    }
 
     private func show(_ window: inout NSWindow?, make: () -> NSWindow) {
         if window == nil {
@@ -134,7 +157,9 @@ func menuBarIcon(count: Int) -> NSImage {
 }
 
 /// Debug: `SimBar --snapshot out.png [--view NAME]` renders a view with live data and exits.
-/// NAME: `panel` (default), `settings`, or `onboarding-1` … `onboarding-5` (one per step).
+/// NAME: `panel` (default), `settings`, `onboarding-1` … `onboarding-5` (one per step), or
+/// `install-progress`: mid-install with sample states, or, with `--claude-dir DIR`, the outcome
+/// of a real install into DIR.
 /// Views are drawn in an off-screen window, so AppKit controls render as they do on screen.
 @MainActor
 enum Snapshot {
@@ -143,6 +168,15 @@ enum Snapshot {
         switch name {
         case "settings":
             view = AnyView(SettingsView())
+        case "install-progress":
+            let run = InstallRun(SetupItem.allCases)
+            if argument("--claude-dir") != nil {
+                Store.shared.runInstall(run)
+            } else {
+                run.set(.script, .done)
+                run.set(.rule, .running)
+            }
+            view = AnyView(InstallProgressView(run: run) {})
         case let s where s.hasPrefix("onboarding"):
             let step = Int(s.split(separator: "-").last ?? "") ?? 1
             view = AnyView(OnboardingView(start: OnboardingView.Step(rawValue: step - 1) ?? .welcome))

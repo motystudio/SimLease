@@ -216,7 +216,7 @@ struct Panel: View {
                     ForEach(todo, id: \.self) { item in
                         switch store.setupStates[item] {
                         case .outdated:
-                            Button { store.install([item]) } label: {
+                            Button { store.installShowingProgress([item]) } label: {
                                 Label(L("Update \(item.title)", "Mettre à jour : \(item.title)"), systemImage: "arrow.triangle.2.circlepath")
                             }
                         case .malformed:
@@ -225,14 +225,14 @@ struct Panel: View {
                                 Label(L("Fix \(item.title)…", "Réparer : \(item.title)…"), systemImage: "exclamationmark.triangle.fill")
                             }
                         default:
-                            Button { store.install([item]) } label: {
+                            Button { store.installShowingProgress([item]) } label: {
                                 Label(L("Install \(item.title)", "Installer : \(item.title)"), systemImage: "exclamationmark.triangle.fill")
                             }
                         }
                     }
                     let silent = todo.filter { store.setupStates[$0]?.installsSilently == true }
                     if silent.count > 1 {
-                        Button(L("Install everything", "Tout installer")) { store.install(silent) }
+                        Button(L("Install everything", "Tout installer")) { store.installShowingProgress(silent) }
                     }
                 }
             }

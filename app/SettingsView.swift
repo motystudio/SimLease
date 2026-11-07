@@ -10,15 +10,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             if config.status == .ready {
-                Section {
-                    NumberRow(L("iOS simulators", "Simulateurs iOS"), key: .maxIOS)
-                    NumberRow(L("Android emulators", "Émulateurs Android"), key: .maxAndroid)
-                } header: {
-                    Text(L("Devices booted at the same time, at most", "Appareils démarrés en même temps, au maximum"))
-                } footer: {
-                    Footnote(L("Past this limit, a session waits for a device to free up.",
-                               "Au-delà, une session attend qu'un appareil se libère."))
-                }
+                DeviceLimits()
                 Section {
                     NumberRow(L("Free a device when its session is idle for", "Libérer un appareil quand sa session est inactive depuis"),
                               key: .staleMin, unit: "min")
@@ -74,6 +66,30 @@ struct SettingsView: View {
         .frame(width: 520)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear { config.load() }
+    }
+}
+
+/// How many devices may run at once, with what this Mac's memory suggests. In Settings and in the assistant.
+struct DeviceLimits: View {
+    @ObservedObject private var config = SimLeaseConfig.shared
+
+    var body: some View {
+        Section {
+            NumberRow(L("iOS simulators", "Simulateurs iOS"), key: .maxIOS)
+            NumberRow(L("Android emulators", "Émulateurs Android"), key: .maxAndroid)
+        } header: {
+            Text(L("Devices booted at the same time, at most", "Appareils démarrés en même temps, au maximum"))
+        } footer: {
+            VStack(alignment: .leading, spacing: 2) {
+                if let s = config.suggested {
+                    let gb = Int(ProcessInfo.processInfo.physicalMemory / 1_073_741_824)
+                    Footnote(L("Suggested for this Mac's \(gb) GB of memory: \(s.ios) iOS and \(s.android) Android. A booted device uses about 6 to 13 GB.",
+                               "Suggéré pour les \(gb) Go de mémoire de ce Mac : \(s.ios) iOS et \(s.android) Android. Un appareil démarré utilise environ 6 à 13 Go."))
+                }
+                Footnote(L("Past this limit, a session waits for a device to free up.",
+                           "Au-delà, une session attend qu'un appareil se libère."))
+            }
+        }
     }
 }
 

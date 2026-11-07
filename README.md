@@ -54,7 +54,7 @@ You can reopen it at any time from the gear menu in SimBar. From then on, new Cl
 
 | Situation | What happens |
 |---|---|
-| A session runs `sim-lease acquire ios` | It gets the device it already holds, otherwise an idle booted device (an iPhone, unless `--name` asks for another), otherwise a new one if the platform is under its cap. A boot doesn't hold up other sessions' `acquire` |
+| A session runs `sim-lease acquire ios` | It gets the device it already holds, otherwise an idle booted device (an iPhone, unless `--name` asks for another), otherwise a new one if the platform is under its cap. If every iOS simulator with the requested name is taken, another one with that name is created and stays available for later. A boot doesn't hold up other sessions' `acquire` |
 | The cap is reached, a released device is kept warm, and the session needs another model | The warm device is shut down to make room, unless it is pinned. Devices started by hand and those of idle sessions are left alone |
 | The session is active | Its device stays reserved for it. Activity is the last modification time of the session's transcript |
 | The session has been idle for 20 min, or runs `sim-lease release` | The device stays booted 10 more min so another session can reuse it, then it is shut down |
@@ -82,12 +82,14 @@ Open **Settings…** from the gear menu in SimBar (⌘,), or use the CLI. Values
 
 | Key | Default | Meaning |
 |---|---|---|
-| `SIM_LEASE_MAX_IOS` | `3` | Maximum number of booted iOS simulators |
-| `SIM_LEASE_MAX_ANDROID` | `2` | Maximum number of booted Android emulators |
+| `SIM_LEASE_MAX_IOS` | From the Mac's memory | Maximum number of booted iOS simulators |
+| `SIM_LEASE_MAX_ANDROID` | From the Mac's memory | Maximum number of booted Android emulators |
 | `SIM_LEASE_STALE_MIN` | `20` | A lease expires when its session has been idle this many minutes |
 | `SIM_LEASE_GRACE_MIN` | `10` | A released device stays booted this many minutes for reuse, then is shut down |
 | `SIM_LEASE_ADOPT_UNMANAGED` | `0` | `1` = also shut down devices started by hand, outside sim-lease |
 | `SIM_LEASE_UNMANAGED_GRACE_MIN` | `30` | With adoption on, minutes before an unleased hand-started device is shut down |
+
+The default limits leave 16 GB for macOS, Xcode and the sessions, then give two thirds of the remaining memory to iOS at 6 GB per simulator, and a third to Android at 8 GB per emulator. That gives 2 iOS and 1 Android up to 36 GB, 3 and 1 with 48 GB, 5 and 2 with 64 GB, 10 and 4 with 128 GB. A value you set yourself always wins.
 
 ```bash
 sim-lease config                          # show the current values
@@ -158,6 +160,7 @@ By hand, remove:
   - the transcript files under `~/.claude/projects/`, whose modification time is used as the session's activity signal;
   - the `claude://` deep link and the Claude desktop app's session folder (`~/Library/Application Support/Claude/claude-code-sessions`), used to show session names and open them. Opening a session therefore works for sessions run in the Claude desktop app.
 - It only works if sessions follow the rule. A session that boots a device itself bypasses the cap; with `SIM_LEASE_ADOPT_UNMANAGED=0` such a device is left alone until a session leases it.
+- A simulator created because all those with the requested name were taken starts empty: apps and data aren't copied, and `acquire` says so. It is kept for later sessions and never deleted automatically; delete it with `xcrun simctl delete UDID` if you don't need it.
 - Physical devices are never touched.
 - macOS only.
 
@@ -173,7 +176,8 @@ The app bundles its own copies of `bin/sim-lease` and `CLAUDE.snippet.md`, which
 Debug flags:
 
 - `SimBar --setup DIR` runs the installation check and install against `DIR`, a stand-in for `~/.claude`, then exits. Add `--replace-rule` to also replace a customized or malformed `<simulators>` block, as the confirmation dialog does.
-- `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data to a PNG and exits. Add `--view settings` or `--view onboarding-1` … `onboarding-5` to render another window, `--sim-lease PATH` to use another script, and `--claude-dir DIR` to check a stand-in for `~/.claude`.
+- `build/SimBar.app/Contents/MacOS/SimBar --snapshot out.png` renders the panel with live data to a PNG and exits. Add `--view settings` or `--view onboarding-1` … `onboarding-5` to render another window, `--sim-lease PATH` to use another script, and `--claude-dir DIR` to check a stand-in for `~/.claude`. `--view install-progress` shows the install window; with `--claude-dir DIR` it really installs into `DIR`.
+- `SimBar --open settings` opens the real Settings window, and `--open install-progress --claude-dir DIR` runs an install into `DIR` in its real window. Neither runs the cleanup or Sparkle.
 
 Releases are cut with `scripts/release.sh`: it builds the app, signs it with a Developer ID, notarizes it, and publishes the zip that GitHub Releases, Sparkle updates and the Homebrew cask all point to. The script documents its steps and the credentials it expects.
 

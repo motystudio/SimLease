@@ -18,7 +18,7 @@ func argument(_ flag: String) -> String? {
 
 /// `--snapshot` / `--setup` runs render or test, then exit, without touching the user's
 /// preferences, showing the onboarding or starting the updater.
-let debugRun = argument("--snapshot") != nil || argument("--setup") != nil
+let debugRun = argument("--snapshot") != nil || argument("--setup") != nil || argument("--open") != nil
 
 /// UserDefaults keys.
 enum Defaults {
@@ -241,6 +241,7 @@ final class Store: ObservableObject {
     private var pending = 0
     nonisolated private let sampler = Sampler()
     private var queue: DispatchQueue { commandQueue }
+    private var installRun: InstallRun?
 
     init() {
         if let dir = argument("--setup") { Store.setupTest(claudeDir: dir) }
@@ -390,6 +391,45 @@ final class Store: ObservableObject {
                     self.refresh()
                     // a newer script may know `config`
                     if items.contains(.script) { SimLeaseConfig.shared.load() }
+                }
+            }
+        }
+    }
+
+    /// Installs the given items from the gear menu, showing each step in a window. Only one at a
+    /// time: a second click brings the window of the running install back to the front.
+    func installShowingProgress(_ items: [SetupItem]) {
+        if let installRun, !installRun.finished { Windows.shared.showInstallProgress(installRun); return }
+        let run = InstallRun(items)
+        installRun = run
+        Windows.shared.showInstallProgress(run)
+        runInstall(run)
+    }
+
+    /// Each item counts as done only once its state, read back from disk, says it is installed.
+    func runInstall(_ run: InstallRun) {
+        let setup = self.setup, items = run.items
+        queue.async {
+            for item in items {
+                let started = Date()
+                DispatchQueue.main.async { MainActor.assumeIsolated { run.set(item, .running) } }
+                var failure: String?
+                do {
+                    try setup.install(item)
+                    if !setup.state(item).isInstalled {
+                        failure = L("Still not installed after the attempt.", "Toujours pas installé après la tentative.")
+                    }
+                } catch { failure = error.localizedDescription }
+                // these steps take milliseconds: long enough to see each of them go by
+                Thread.sleep(forTimeInterval: max(0, 0.4 - Date().timeIntervalSince(started)))
+                let result: InstallRun.Status = failure.map { .failed($0) } ?? .done
+                DispatchQueue.main.async { MainActor.assumeIsolated { run.set(item, result) } }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    run.finished = true
+                    self.refresh()
+                    if items.contains(.script) { SimLeaseConfig.shared.load() }   // a newer script may know `config`
                 }
             }
         }
