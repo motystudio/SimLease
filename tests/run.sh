@@ -21,7 +21,7 @@ S=$SL_STATE; echo "xcrun $*" >> "$S/calls"
 [ "$1" = simctl ] && shift
 set_state() { awk -F'\t' -v OFS='\t' -v u="$1" -v st="$2" '$1==u{$3=st}1' "$S/ios" > "$S/ios.t"; mv "$S/ios.t" "$S/ios"; }
 case "$1 $2" in
-  "list devices") /usr/bin/jq -Rn --arg b "$3" '[inputs | split("\t") | {udid:.[0], name:.[1], state:.[2], isAvailable:true}]
+  "list devices") while [ -f "$S/hanglist" ]; do sleep 0.2; done; /usr/bin/jq -Rn --arg b "$3" '[inputs | split("\t") | {udid:.[0], name:.[1], state:.[2], isAvailable:true}]
       | (if $b == "booted" then map(select(.state == "Booted")) else . end) | {devices: {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": .}}' < "$S/ios" ;;
   "boot "*) set_state "$2" Booted ;;
   "bootstatus "*) while [ -f "$S/hang" ]; do sleep 0.2; done ;;
@@ -43,6 +43,7 @@ cat > "$T/sdk/emulator/emulator" <<'EOF'
 #!/bin/bash
 S=$SL_STATE; echo "emulator $*" >> "$S/calls"
 [ "$1" = -list-avds ] && cat "$S/avds"
+[ "$1" = -avd ] && [ -f "$S/race" ] && printf 'emulator-5600\tPixel_B\n' >> "$S/android"
 [ "$1" = -avd ] && printf 'emulator-%s\t%s\n' $((5554 + 2 * $(grep -c . "$S/android"))) "$2" >> "$S/android"
 EOF
 chmod +x "$T/bin/"* "$T/sdk/platform-tools/adb" "$T/sdk/emulator/emulator"
@@ -56,7 +57,7 @@ run_to() { # secs cmd... -> runs sl in the background, 124 if still running afte
   wait $p
 }
 reset() { # ios lines "udid name state", android lines "serial avd"
-  rm -rf "$D" "$H/.claude/projects" "$S/hang" "$S/noxcode"; mkdir -p "$D" "$H/.claude/projects/p"; X=""; : > "$S/calls"
+  rm -rf "$D" "$H/.claude/projects" "$S/hang" "$S/hanglist" "$S/noxcode" "$S/race"; mkdir -p "$D" "$H/.claude/projects/p"; X=""; : > "$S/calls"
   printf '%s\n' "$U1	iPhone 17 Pro	Booted" "$U2	iPhone 17	Shutdown" > "$S/ios"; : > "$S/android"; printf 'Pixel_A\nPixel_B\n' > "$S/avds"
 }
 ago() { local m=$1; shift; touch -t "$(date -r $(( $(date +%s) - m * 60 )) +%Y%m%d%H%M.%S)" "$@"; }   # minutes file...
@@ -132,10 +133,9 @@ run_to 3 reap; rc=$?; check "old lock of a live PID is not broken" '[ $rc = 124 
 kill $L; wait $L 2>/dev/null; rm -rf "$LOCK"
 reset; mkdir "$LOCK"; ago 11 "$LOCK"; run_to 5 reap; rc=$?; check "PID-less lock older than 10 min is broken" '[ $rc = 0 ] && [ ! -d "$LOCK" ]'
 reset; mkdir "$LOCK"; run_to 2 reap; rc=$?; check "fresh PID-less lock is kept" '[ $rc = 124 ] && [ -d "$LOCK" ]'
-reset; sed -i '' "s/	Booted$/	Shutdown/" "$S/ios"; transcript $ME.jsonl 0; touch "$S/hang"
-sl acquire ios > "$T/out" 2>&1 & A=$!
-for i in $(seq 50); do grep -q bootstatus "$S/calls" && break; sleep 0.1; done
-sleep 300 & L=$!; echo $L > "$LOCK/pid"; rm "$S/hang"; wait $A
+reset; touch "$S/hanglist"; sl reap & A=$!
+for i in $(seq 50); do [ -f "$LOCK/pid" ] && break; sleep 0.1; done
+sleep 300 & L=$!; echo $L > "$LOCK/pid"; rm "$S/hanglist"; wait $A
 check "EXIT trap leaves a lock that isn't ours" '[ "$(cat "$LOCK/pid" 2>/dev/null)" = $L ]'
 kill $L; wait $L 2>/dev/null; rm -rf "$LOCK"
 reset; sed -i '' "s/	Booted$/	Shutdown/" "$S/ios"; transcript $ME.jsonl 0; touch "$S/hang"; X=SIM_LEASE_BOOT_TIMEOUT_SEC=2
@@ -150,5 +150,76 @@ check "pin with a lowercase UDID is an iOS pin (uppercased)" 'grep -qx "AAAAAAAA
 reset; touch "$S/noxcode"; printf 'emulator-5554\tPixel_A\n' > "$S/android"; sl json > "$T/out"; sl status > /dev/null; sl reap
 check "no Xcode: json/status/reap never run xcrun" '! grep -q xcrun "$S/calls" && [ "$(/usr/bin/jq -r "map(.platform) | join(\",\")" "$T/out")" = android ]'
 check "Intel Homebrew Android SDK is searched" 'grep -q /usr/local/share/android-commandlinetools "$SCRIPT"'
+
+echo "== 6. a full cap only blocks when nothing can be freed"
+reset; lease $U1 ios "iPhone 17 Pro" none 5 $(( $(date +%s) - 300 )); transcript $ME.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+out=$(sl acquire ios --name "iPhone 17" 2>/dev/null); rc=$?
+check "a device kept warm makes room for the named one" '[ $rc = 0 ] && [ "$out" = $U2 ] && grep -q "simctl shutdown $U1" "$S/calls" && grep -q "simctl boot $U2" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" none 5 $(( $(date +%s) - 300 )); printf '%s\n' $U1 > "$D/.pinned"; transcript $ME.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+run_to 5 acquire ios --name "iPhone 17"; rc=$?
+check "a pinned device isn't freed: exit 3" '[ $rc = 3 ] && ! grep -q "simctl shutdown" "$S/calls" && grep -q "cap of 1" "$T/err"'
+reset; transcript $ME.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+run_to 5 acquire ios --name "iPhone 17"; rc=$?
+check "a hand-started device isn't freed, and the error doesn't call it in use" '[ $rc = 3 ] && ! grep -q "simctl shutdown" "$S/calls" && ! grep -q "in use" "$T/err" && grep -q "test is blocked" "$T/err"'
+reset; lease $U1 ios "iPhone 17 Pro" other 0; transcript other.jsonl 0; transcript $ME.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+run_to 5 acquire ios --name "iPhone 17"; rc=$?
+check "a device in use isn't freed" '[ $rc = 3 ] && ! grep -q "simctl shutdown" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" unmanaged 5 $(date +%s); transcript $ME.jsonl 0; X="SIM_LEASE_MAX_IOS=1 SIM_LEASE_ADOPT_UNMANAGED=1"
+run_to 5 acquire ios --name "iPhone 17"; rc=$?
+check "an adopted hand-started device isn't freed" '[ $rc = 3 ] && ! grep -q "simctl shutdown" "$S/calls"'
+reset; lease $U1 ios "iPhone 17 Pro" other 25; transcript other.jsonl 25; transcript $ME.jsonl 0; X=SIM_LEASE_MAX_IOS=1
+run_to 5 acquire ios --name "iPhone 17"; rc=$?
+check "a session gone idle keeps its grace period" '[ $rc = 3 ] && ! grep -q "simctl shutdown" "$S/calls"'
+reset; printf 'Pixel_A\n' > "$S/avds"; printf 'emulator-5554\tPixel_A\n' > "$S/android"; lease emulator-5554 android Pixel_A other 0; transcript other.jsonl 0; transcript $ME.jsonl 0
+run_to 15 acquire android --wait 3; rc=$?
+check "every device busy under the cap: --wait is honoured, then exit 3, not an error" '[ $rc = 3 ] && grep -q "every android device is in use" "$T/err"'
+reset; printf 'Pixel_A\n' > "$S/avds"; transcript $ME.jsonl 0
+run_to 5 acquire ios --name "iPhone 99"; rc=$?
+check "an unknown device name is an error, not exit 3" '[ $rc = 1 ] && grep -q "no free ios device" "$T/err"'
+
+echo "== 7. a boot doesn't hold the lock"
+reset; lease $U1 ios "iPhone 17 Pro" holder 0; transcript holder.jsonl 0; transcript booter.jsonl 0; transcript third.jsonl 0; touch "$S/hang"
+ME=booter; sl acquire ios > "$T/booted" 2> /dev/null & A=$!
+for i in $(seq 50); do grep -q bootstatus "$S/calls" && break; sleep 0.1; done
+ME=holder; run_to 4 acquire ios; rc=$?
+check "the holder refreshes its lease during another session's boot" '[ $rc = 0 ] && [ "$(cat "$T/out")" = $U1 ]'
+ME=third; X=SIM_LEASE_MAX_IOS=2; run_to 4 acquire ios; rc=$?
+check "the device being booted fills its slot and can't be taken" '[ $rc = 3 ] && grep -q booting "$T/err"'
+X=""; run_to 4 shutdown-idle; check "shutdown-idle spares a device being booted" '! grep -q "simctl shutdown $U2" "$S/calls"'
+rm "$S/hang"; wait $A
+check "the boot ends with a lease and no reservation" '[ "$(cat "$T/booted")" = $U2 ] && grep -q "session=booter" "$D/$U2" && ! ls "$D"/.boot.* >/dev/null 2>&1'
+ME=me-session
+reset; U3=33333333-3333-3333-3333-333333333333; printf '%s\tiPhone 17\tShutdown\n' $U3 >> "$S/ios"; sed -i '' "/^$U1/d" "$S/ios"; touch "$S/hang"; transcript a.jsonl 0; transcript b.jsonl 0
+ME=a; sl acquire ios > "$T/a" 2> /dev/null & A=$!
+for i in $(seq 50); do grep -q bootstatus "$S/calls" && break; sleep 0.1; done
+ME=b; sl acquire ios > "$T/b" 2> /dev/null & B=$!
+for i in $(seq 50); do [ "$(grep -c bootstatus "$S/calls")" = 2 ] && break; sleep 0.1; done
+rm "$S/hang"; wait $A $B; ME=me-session
+check "two boots at once take two different devices" '[ -s "$T/a" ] && [ -s "$T/b" ] && [ "$(cat "$T/a")" != "$(cat "$T/b")" ]'
+reset; sed -i '' "s/	Booted$/	Shutdown/" "$S/ios"; bash -c 'exit 0' & d=$!; wait $d; printf 'ios\t%s\tiPhone 17 Pro\n' $U1 > "$D/.boot.$d"; transcript $ME.jsonl 0
+out=$(sl acquire ios 2>/dev/null)
+check "the reservation of a dead process is ignored and removed" '[ "$out" = $U1 ] && [ ! -f "$D/.boot.$d" ]'
+reset; sed -i '' "s/	Booted$/	Shutdown/" "$S/ios"; sleep 300 & L=$!; printf 'ios\t%s\tiPhone 17 Pro\n' $U1 > "$D/.boot.$L"; ago 40 "$D/.boot.$L"; transcript $ME.jsonl 0
+out=$(sl acquire ios 2>/dev/null)
+check "a reservation too old for a boot is ignored, even if its PID is alive" '[ "$out" = $U1 ] && [ ! -f "$D/.boot.$L" ]'
+kill $L; wait $L 2>/dev/null
+reset; sed -i '' "s/	Booted$/	Shutdown/" "$S/ios"; transcript $ME.jsonl 0; touch "$S/hang"
+sl acquire ios > "$T/out" 2> "$T/err" & A=$!
+for i in $(seq 50); do grep -q bootstatus "$S/calls" && break; sleep 0.1; done
+sl kill $U1 > /dev/null; rm "$S/hang"; wait $A; rc=$?
+check "a device shut down during its boot isn't handed out" '[ $rc = 1 ] && [ ! -s "$T/out" ] && grep -q "shut down while" "$T/err" && [ ! -f "$D/$U1" ]'
+reset; touch "$S/race"; transcript $ME.jsonl 0; sed -i '' "/^$U1/d;/^$U2/d" "$S/ios"
+out=$(sl acquire android 2>/dev/null)
+check "Android: the serial returned is the AVD's, not another session's new emulator" '[ "$out" = emulator-5556 ] && grep -q "name=Pixel_A" "$D/$out"'
+reset; printf 'emulator-5554\tPixel_A\n' > "$S/android"; lease emulator-5554 android Pixel_A none 5 $(( $(date +%s) - 300 )); transcript $ME.jsonl 0; X=SIM_LEASE_MAX_ANDROID=1
+: > "$S/calls"; run_to 15 acquire android --name Pixel_B; rc=$?
+check "Android: a warm emulator makes room, and the new one may take its serial" '[ $rc = 0 ] && [ "$(cat "$T/out")" = emulator-5554 ] && grep -q "name=Pixel_B" "$D/emulator-5554"'
+
+echo "== 8. without --name, iOS only reuses an iPhone"
+reset; sed -i '' "/^$U1/d" "$S/ios"; printf '%s\tiPad Pro 13-inch\tBooted\n' $U1 >> "$S/ios"; transcript $ME.jsonl 0
+out=$(sl acquire ios 2>/dev/null)
+check "an idle iPad is skipped, an iPhone is booted" '[ "$out" = $U2 ]'
+out=$(sl acquire ios --name "iPad Pro 13-inch" 2>/dev/null)
+check "--name still gets the iPad" '[ "$out" = $U1 ]'
 
 echo; echo "$pass passed, $fail failed"; [ "$fail" = 0 ]

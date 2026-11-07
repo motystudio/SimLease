@@ -6,7 +6,7 @@ Run four Claude Code sessions on mobile projects and you can end up with four or
 
 SimLease has two parts:
 
-- **`sim-lease`**, a bash script that sessions call to *lease* a device. It hands back a device the session already holds, otherwise an idle booted one, and boots a new one only while under a cap. Devices nobody is using are shut down after a grace period.
+- **`sim-lease`**, a bash script that sessions call to *lease* a device. It hands back a device the session already holds, otherwise an idle booted one, otherwise it boots a new one, up to a cap. Devices nobody is using are shut down after a grace period.
 - **SimBar**, a menu bar app that shows the booted devices with the RAM and CPU of each, which session is using them, and lets you open that session, show the device, pin it or shut it down. It also runs the cleanup every 5 minutes.
 
 ![SimBar](docs/simbar.png)
@@ -54,13 +54,14 @@ You can reopen it at any time from the gear menu in SimBar. From then on, new Cl
 
 | Situation | What happens |
 |---|---|
-| A session runs `sim-lease acquire ios` | It gets the device it already holds, otherwise an idle booted device, otherwise a new one if the platform is under its cap |
+| A session runs `sim-lease acquire ios` | It gets the device it already holds, otherwise an idle booted device (an iPhone, unless `--name` asks for another), otherwise a new one if the platform is under its cap. A boot doesn't hold up other sessions' `acquire` |
+| The cap is reached, a released device is kept warm, and the session needs another model | The warm device is shut down to make room, unless it is pinned. Devices started by hand and those of idle sessions are left alone |
 | The session is active | Its device stays reserved for it. Activity is the last modification time of the session's transcript |
 | The session has been idle for 20 min, or runs `sim-lease release` | The device stays booted 10 more min so another session can reuse it, then it is shut down |
 | The session ends | The `SessionEnd` hook releases its devices (same 10 min grace) |
 | A device was started by hand, outside sim-lease | It is left alone by default. With `SIM_LEASE_ADOPT_UNMANAGED=1`, it is shut down after 30 min unless a session leases it. A session can lease it either way, and from then on it is managed like any other |
 | A device is pinned (`sim-lease pin ID`, or the pin in SimBar) | It is never shut down automatically, only by hand |
-| Every device of a platform is in use | `acquire` exits with code 3; retry with `--wait 300` |
+| The cap is reached and no device can be freed | `acquire` exits with code 3; retry with `--wait 300` |
 
 Physical devices are never touched: only simulators and emulators (`emulator-*` serials) are listed or shut down.
 
@@ -114,13 +115,13 @@ sim-lease version                    print the version
 sim-lease help                       print this list
 ```
 
-`acquire` must run inside a Claude Code session: it identifies the session with `CLAUDE_CODE_SESSION_ID`. `--name` takes a simulator name or UDID on iOS, an AVD name on Android. Exit code 3 means every device of that platform is in use.
+`acquire` must run inside a Claude Code session: it identifies the session with `CLAUDE_CODE_SESSION_ID`. `--name` takes a simulator name or UDID on iOS, an AVD name on Android. Without `--name`, iOS only gets an iPhone. Exit code 3 means the cap is reached and no device can be freed.
 
 ## Teaching Claude Code to use it
 
 The script only helps if sessions call it. The setup assistant installs two things for that:
 
-- **The `<simulators>` rule** in `~/.claude/CLAUDE.md` tells every session never to boot a simulator or emulator itself, to get one with `sim-lease acquire`, to use only that device ID, and to run `sim-lease release` when done. The text is in [CLAUDE.snippet.md](CLAUDE.snippet.md); you can paste it yourself instead. SimBar adds a `<!-- simbar-rule … -->` line inside the block so it can tell its own text from yours: a block you edited is never replaced without asking.
+- **The `<simulators>` rule** in `~/.claude/CLAUDE.md` tells every session to keep testing on devices as often as it otherwise would, to get them with `sim-lease acquire` rather than booting them directly, to use only that device ID, to tell the user when a test is blocked, and to run `sim-lease release` when done, unless the user may want to look at the app. The text is in [CLAUDE.snippet.md](CLAUDE.snippet.md); you can paste it yourself instead. SimBar adds a `<!-- simbar-rule … -->` line inside the block so it can tell its own text from yours: a block you edited is never replaced without asking.
 - **The `SessionEnd` hook** in `~/.claude/settings.json` releases a session's devices when it ends, for sessions that forget. To add it by hand, append this entry to `hooks.SessionEnd`:
 
   ```json

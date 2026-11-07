@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-07
+
+### Changed
+
+- The `<simulators>` rule now opens by saying it never reduces how often to test, tells sessions to report a blocked test instead of dropping it, and lets them keep a device the user may want to look at. An unedited rule is updated by SimBar.
+- A boot no longer holds up other sessions' `acquire`: a session refreshing its lease or reusing an idle device gets an answer right away.
+- `acquire --name` shuts down a released device kept warm when it fills the last slot under the cap, instead of exiting with code 3. Pinned devices, hand-started devices and those of idle sessions are left alone.
+
+### Fixed
+
+- `acquire` without `--name` no longer hands back an idle iPad or Apple Watch for iOS.
+- The exit code 3 message no longer claims that idle devices are in use by other sessions.
+- `acquire --name` with a device that doesn't exist fails with an error saying so, instead of exit code 3 when the cap is reached.
+- `acquire` with every device busy under the cap exits with code 3 and honours `--wait`, instead of failing with an error.
+- `acquire` no longer hands back a simulator that was shut down during its boot.
+- Android: when two emulators boot at once, `acquire` returns the one it started.
+
 ## [1.0.0] - 2026-11-06
 
 Initial public release.
@@ -24,5 +41,6 @@ Initial public release.
 - Automatic updates with Sparkle.
 - Homebrew cask (`brew install --cask motystudio/tap/simlease`), signed and notarized universal build (Apple silicon and Intel).
 
-[Unreleased]: https://github.com/motystudio/SimLease/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/motystudio/SimLease/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/motystudio/SimLease/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/motystudio/SimLease/releases/tag/v1.0.0

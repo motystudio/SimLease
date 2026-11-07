@@ -112,9 +112,9 @@ has_simctl() {
 need_simctl() { has_simctl || die "xcrun simctl not available: install Xcode, open it once, then run: sudo xcode-select -s /Applications/Xcode.app"; }
 need_adb() { [ -n "$ADB" ] || die "adb not found: install the Android SDK platform-tools, or set ANDROID_HOME"; }
 
-# $LOCK/pid holds the holder's PID. A lock is broken only when that process is gone (boots
-# hold it for minutes), or, without a PID file (killed right after mkdir), after 10 min.
-try_lock() { mkdir "$LOCK" 2>/dev/null || return 1; echo $$ > "$LOCK/pid"; trap unlock EXIT; }
+# $LOCK/pid holds the holder's PID. A lock is broken only when that process is gone, or,
+# without a PID file (killed right after mkdir), after 10 min. It is not held during a boot.
+try_lock() { mkdir "$LOCK" 2>/dev/null || return 1; echo $$ > "$LOCK/pid"; }
 lock() {
   local i=0 pid
   until try_lock; do
@@ -131,7 +131,28 @@ lock() {
     sleep 1
   done
 }
-unlock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; }; trap - EXIT; }
+unlock() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; }; return 0; }
+
+# A boot runs outside the lock, so that other sessions aren't held up for minutes. $DIR/.boot.<pid>
+# reserves the device and its slot under the cap until the lease is written ("platform<TAB>key<TAB>name",
+# key = UDID on iOS, AVD name on Android). It counts only while that process is alive, and not past
+# the longest a boot and the wait for the lock can last, in case that PID now is another process.
+BOOTRES=""
+trap 'unlock; [ -z "$BOOTRES" ] || rm -f "$BOOTRES"' EXIT
+reservations() {
+  local f
+  for f in "$DIR"/.boot.*; do
+    [ -f "$f" ] || continue
+    if kill -0 "${f##*.}" 2>/dev/null && [ $(( $(now) - $(stat -f %m "$f" 2>/dev/null || echo 0) )) -lt $((BOOT_TIMEOUT + 900)) ]; then cat "$f"
+    else rm -f "$f"; fi
+  done
+}
+is_booting() { # platform id name, against the snapshot in $RES
+  local k=$2; [ "$1" = android ] && k=$3
+  [ -n "$k" ] && printf '%s\n' "$RES" | awk -F'\t' -v p="$1" -v k="$k" '$1==p && $2==k {f=1} END {exit !f}'
+}
+res_keys() { printf '%s\n' "$RES" | awk -F'\t' -v p="$1" '$1==p {print $2}'; }   # platform
+RES=""
 
 # --- lease files: $DIR/<id>, key=value lines -------------------------------
 lget() { grep -m1 "^$2=" "$DIR/$1" 2>/dev/null | cut -d= -f2-; }
@@ -221,44 +242,46 @@ shutdown_dev() { # id platform  (keeps the lease if the device didn't actually s
   drop "$1"; log "shutdown $2 $1"
 }
 
-ios_pick() { # [name|udid] -> udid of the shutdown simulator to boot (newest iOS, Pro first), or nothing
-  xcrun simctl list devices available -j 2>/dev/null | "$JQ" -r --arg w "${1:-}" '
-    .devices | to_entries | map(select(.key|test("iOS-")))
+ios_pick() { # [name|udid] [excluded udids] -> "udid<TAB>name" of the shutdown simulator to boot (newest iOS, Pro first), or nothing
+  xcrun simctl list devices available -j 2>/dev/null | "$JQ" -r --arg w "${1:-}" --arg x "${2:-}" '
+    ($x | split("\n")) as $xs
+    | .devices | to_entries | map(select(.key|test("iOS-")))
     | sort_by(.key|capture("iOS-(?<a>[0-9]+)-(?<b>[0-9]+)")|[(.a|tonumber),(.b|tonumber)]) | reverse
-    | [.[].value[] | select(.state=="Shutdown")
+    | [.[].value[] | select(.state=="Shutdown") | select(.udid as $u | any($xs[]; . == $u) | not)
        | select(if $w=="" then (.name|test("^iPhone")) else (.name==$w or .udid==$w) end)]
-    | (map(select(.name|test("Pro$"))) + .) | .[0].udid // empty'
+    | (map(select(.name|test("Pro$"))) + .) | .[0] // empty | "\(.udid)\t\(.name)"'
 }
-boot_ios() { # [name|udid] -> udid
-  local want="${1:-}" udid pid i
-  udid=$(ios_pick "$want")
-  [ -n "$udid" ] || die "no shutdown iOS simulator matching '${want:-iPhone}' (add one in Xcode > Window > Devices and Simulators)"
+boot_ios() { # udid -> udid
+  local udid=$1 pid i
   xcrun simctl boot "$udid" >/dev/null 2>&1 || ios_booted | cut -f1 | grep -qx "$udid" || die "could not boot simulator $udid"
-  # bootstatus has no timeout (a first boot after an Xcode update can take 10+ min) and we hold the lock
+  # bootstatus has no timeout: a first boot after an Xcode update can take 10+ min
   xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 & pid=$!
   for ((i = 0; i < BOOT_TIMEOUT; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   if kill -0 "$pid" 2>/dev/null; then
     pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; log "boot timeout ios $udid"
     die "simulator $udid did not finish booting in $((BOOT_TIMEOUT / 60)) min; it may still be booting: run acquire again in a few minutes"
   fi
+  ios_booted | cut -f1 | grep -qx "$udid" || die "simulator $udid was shut down while it was booting: run acquire again"
   echo "$udid"
 }
-boot_android() { # [avd] -> serial
-  local want="${1:-}" running avd="" a before s i
+android_pick() { # [avd] [excluded avds] -> "avd<TAB>avd" to boot, or nothing
+  local a running
   [ -n "$EMULATOR" ] || die "Android emulator not found: install it with the Android SDK, or set ANDROID_HOME"
   need_adb
-  running=$(android_booted | cut -f2)
+  running=$(android_booted | cut -f2; printf '%s\n' "${2:-}")
   for a in $("$EMULATOR" -list-avds 2>/dev/null | grep -v '^INFO'); do
     echo "$running" | grep -qx "$a" && continue
-    if [ -z "$want" ] || [ "$a" = "$want" ]; then avd="$a"; break; fi
+    if [ -z "${1:-}" ] || [ "$a" = "$1" ]; then printf '%s\t%s\n' "$a" "$a"; return; fi
   done
-  [ -n "$avd" ] || die "no free AVD matching '${want:-any}'"
-  before=$("$ADB" devices | awk '/^emulator-/{print $1}')
+}
+boot_android() { # avd -> serial
+  local avd=$1 s i
   nohup "$EMULATOR" -avd "$avd" -no-snapshot-save -no-boot-anim >/dev/null 2>&1 &
   for i in $(seq 1 240); do
     sleep 1
     for s in $("$ADB" devices | awk '/^emulator-/{print $1}'); do
-      echo "$before" | grep -qx "$s" && continue
+      # by AVD name, not "a new serial": another session may be booting too, and a serial can be reused
+      [ "$("$ADB" -s "$s" emu avd name 2>/dev/null | head -1 | tr -d '\r')" = "$avd" ] || continue
       [ "$("$ADB" -s "$s" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { echo "$s"; return; }
     done
   done
@@ -268,7 +291,7 @@ boot_android() { # [avd] -> serial
 # --- commands ----------------------------------------------------------------
 reap() { # (under the lock)
   local id p s idle_since grace ok list name gone=" "
-  scan; prune
+  RES=$(reservations); scan; prune
   for id in $(leases); do
     p=$(lget "$id" platform); [ "$p" = ios ] || p=android
     ok="OK_$p"; [ "${!ok}" = 1 ] || continue
@@ -291,13 +314,27 @@ reap() { # (under the lock)
     list="LIST_$p"
     while IFS=$'\t' read -r id name; do
       [ -n "$id" ] && [ ! -f "$DIR/$id" ] || continue
+      is_booting "$p" "$id" "$name" && continue
       lwrite "$id" "$p" "$name" unmanaged "$(now)"; log "adopt $p $id ($name)"
     done <<< "${!list}"
   done
 }
 
+free_slot() { # platform: at the cap, shut down a device kept warm for reuse to boot the one asked for.
+  # Released devices only: a hand-started one (with or without adoption) stays left alone, and
+  # a session that merely went idle keeps its grace period, it may be in a long tool call.
+  local p=$1 list="LIST_$1" id name
+  while IFS=$'\t' read -r id name; do
+    [ -n "$id" ] && ! is_booting "$p" "$id" "$name" && lease_matches "$id" "$name" || continue
+    [ "$(lget "$id" session)" = none ] || continue
+    pinned "$id" "$p" "$name" && continue
+    shutdown_dev "$id" "$p" && { log "freed a slot: $p $id ($name)"; return 0; }
+  done <<< "${!list}"
+  return 1
+}
+
 acquire() {
-  local p="${1:-}" want="" wait=0 id name n max deadline list held
+  local p="${1:-}" want="" wait=0 id name n max deadline list held pick key
   shift || true
   [ "$p" = ios ] || [ "$p" = android ] || die "usage: sim-lease acquire ios|android [--name NAME] [--wait SECS]"
   while [ $# -gt 0 ]; do case "$1" in
@@ -322,34 +359,46 @@ acquire() {
       [ -z "$want" ] || [ "$(lget "$id" name)" = "$want" ] || [ "$id" = "$want" ] || continue
       touch "$DIR/$id"; echo "$id"; return 0
     done
-    # 2. a booted device nobody is using (a named one held by a live session is busy)
-    list="LIST_$p"; held=0
+    # 2. a booted device nobody is using, an iPhone unless a name says otherwise (held = what
+    #    was asked for exists, but a live session holds it or is booting it)
+    list="LIST_$p"; held=0; n=$(res_keys "$p" | grep -c .)
+    printf '%s\n' "$RES" | awk -F'\t' -v p="$p" -v w="$want" '$1==p && (w=="" || $2==w || $3==w) {f=1} END {exit !f}' && held=1
     while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
+      is_booting "$p" "$id" "$name" && continue
+      n=$((n+1))
       [ -z "$want" ] || [ "$name" = "$want" ] || [ "$id" = "$want" ] || continue
-      lease_live "$id" && { [ -n "$want" ] && held=1; continue; }
+      [ -n "$want" ] || [ "$p" = android ] || [[ "$name" == iPhone* ]] || continue
+      lease_live "$id" && { held=1; continue; }
       lwrite "$id" "$p" "$name" "$SID" "" "$HOST_SID"; log "lease $p $id ($name) -> $SID (reused)"
       echo "$id"; return 0
     done <<< "${!list}"
-    # 3. boot a new one if under the cap, unless the named device is busy (an AVD runs once;
-    #    an iOS name can still match another, shutdown simulator)
-    [ "$held" = 1 ] && [ "$p" = ios ] && [ -n "$(ios_pick "$want")" ] && held=0
-    n=$(printf '%s\n' "${!list}" | grep -c .)
-    if [ "$held" = 0 ] && [ "$n" -lt "$max" ]; then
-      if [ "$p" = ios ]; then id=$(boot_ios "$want") || exit 1
-      else id=$(boot_android "$want") || exit 1; fi
-      name=$(booted "$p" | awk -F'\t' -v u="$id" '$1==u{print $2}')
-      lwrite "$id" "$p" "$name" "$SID" "" "$HOST_SID"; log "lease $p $id ($name) -> $SID (booted)"
-      echo "$id"; return 0
+    # 3. boot a new one, unless what was asked for is busy and has no free twin (an AVD runs
+    #    once; an iOS name can match another, shutdown simulator)
+    if [ "$p" = ios ]; then pick=$(ios_pick "$want" "$(res_keys ios)"); else pick=$(android_pick "$want" "$(res_keys android)"); fi
+    key=${pick%%$'\t'*}; name=${pick#*$'\t'}
+    [ -z "$key" ] || held=0
+    if [ "$held" = 0 ]; then
+      [ -n "$key" ] || die "no free $p device matching '${want:-any}' (see \`xcrun simctl list devices available\` or \`emulator -list-avds\`; add one in Xcode or Android Studio)"
+      [ "$n" -eq "$max" ] && [ "$max" -gt 0 ] && free_slot "$p" && n=$((n-1))
+      if [ "$n" -lt "$max" ]; then
+        BOOTRES="$DIR/.boot.$$"; printf '%s\t%s\t%s\n' "$p" "$key" "$name" > "$BOOTRES"
+        unlock
+        if [ "$p" = ios ]; then id=$(boot_ios "$key") || exit 1; else id=$(boot_android "$key") || exit 1; fi
+        lock
+        lwrite "$id" "$p" "$name" "$SID" "" "$HOST_SID"; log "lease $p $id ($name) -> $SID (booted)"
+        rm -f "$BOOTRES"; BOOTRES=""
+        echo "$id"; return 0
+      fi
     fi
     unlock
     if [ "$(now)" -ge "$deadline" ]; then
       if [ "$held" = 1 ]; then
-        echo "sim-lease: $want is in use by another session:" >&2; status >&2
-        echo "Retry with --wait 300, or acquire without --name." >&2
+        echo "sim-lease: ${want:-every $p device} is in use by another session:" >&2; status >&2
+        echo "Retry with --wait 300${want:+, or acquire without --name}. If it stays busy, tell the user the test is blocked." >&2
       else
-        echo "sim-lease: all $max $p devices are in use by other sessions:" >&2; status >&2
-        echo "Retry with --wait 300, or ask the user to raise SIM_LEASE_MAX_$(echo "$p" | tr a-z A-Z)." >&2
+        echo "sim-lease: the cap of $max $p device(s) is reached and none can be freed:" >&2; status >&2
+        echo "Retry with --wait 300. If it still fails, tell the user the test is blocked: they can raise SIM_LEASE_MAX_$(echo "$p" | tr a-z A-Z) or shut a device down." >&2
       fi
       exit 3
     fi
@@ -371,13 +420,14 @@ release() { # [id] [session]  (device stays booted GRACE_MIN so the next session
 
 status() {
   local p id name s ra info list
-  scan
+  RES=$(reservations); scan
   for p in ios android; do
     list="LIST_$p"
     while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
       s=""; lease_matches "$id" "$name" && s=$(lget "$id" session)   # else: stale lease of another device
-      if [ -n "$s" ] && lease_live "$id"; then info="leased by $s (active $(( ($(now) - $(lease_last_active "$id"))/60 )) min ago)"
+      if is_booting "$p" "$id" "$name"; then info="booting"
+      elif [ -n "$s" ] && lease_live "$id"; then info="leased by $s (active $(( ($(now) - $(lease_last_active "$id"))/60 )) min ago)"
       elif [ -z "$s" ]; then info="no lease"
       else ra=$(lget "$id" released_at); info="idle ($s) since $(( ($(now) - ${ra:-$(now)})/60 )) min"; fi
       printf '%-8s %-38s %-26s %s\n' "$p" "$id" "$name" "$info"
@@ -436,10 +486,11 @@ kill_dev() { # id — shut down now, whoever holds it
 
 shutdown_idle() {
   local p id name
-  lock
+  lock; RES=$(reservations)
   for p in ios android; do
     booted "$p" | while IFS=$'\t' read -r id name; do
       [ -n "$id" ] || continue
+      is_booting "$p" "$id" "$name" && continue
       { lease_matches "$id" "$name" && lease_live "$id"; } || pinned "$id" "$p" "$name" || shutdown_dev "$id" "$p"
     done
   done
